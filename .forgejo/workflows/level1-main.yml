@@ -181,6 +181,11 @@ jobs:
 
       - name: Build + Test (iteration 0)
         id: build
+        # Don't fail the job on this step's exit code - the AI-fix
+        # loop below may successfully fix the build. The job's final
+        # status is determined by whether the AI-fix loop (or the
+        # build, if no fix was needed) produced a green build.
+        continue-on-error: true
         run: |
           set -o pipefail
           case "${{ needs.detect.outputs.language }}" in
@@ -206,7 +211,7 @@ jobs:
           esac
 
       - name: AI-fix loop (3 attempts)
-        if: failure()
+        if: steps.build.outcome == 'failure'
         run: |
           set -uo pipefail
           for iter in 1 2 3; do
