@@ -579,7 +579,7 @@ jobs:
   # there's nothing to bottle.
   # ============================================================
   bottles:
-    needs: [detect, release]
+    needs: [detect, release, build-iterate]
     if: |
       needs.release.result == 'success' &&
       contains('rust go', needs.detect.outputs.language)
@@ -681,12 +681,10 @@ jobs:
         run: |
           set -euo pipefail
           BOT=/tmp/bottles/x86_64_linux
-          rm -rf "$BOT"
           mkdir -p "$BOT/akclip/$VERSION/.brew"
           if [ -f Formula/akclip.rb ]; then
             cp Formula/akclip.rb "$BOT/akclip/$VERSION/.brew/akclip.rb"
           fi
-          cp target/release/$BIN "$BOT/akclip/$VERSION/bin/$BIN"
 
           cd "$BOT"
           tar czf "/tmp/${BIN}-${VERSION}.x86_64_linux.bottle.1.tar.gz" akclip
@@ -710,12 +708,10 @@ jobs:
         run: |
           set -euo pipefail
           BOT=/tmp/bottles/arm64_linux
-          rm -rf "$BOT"
           mkdir -p "$BOT/akclip/$VERSION/.brew"
           if [ -f Formula/akclip.rb ]; then
             cp Formula/akclip.rb "$BOT/akclip/$VERSION/.brew/akclip.rb"
           fi
-          cp target/release/$BIN "$BOT/akclip/$VERSION/bin/$BIN"
 
           cd "$BOT"
           tar czf "/tmp/${BIN}-${VERSION}.arm64_linux.bottle.1.tar.gz" akclip
