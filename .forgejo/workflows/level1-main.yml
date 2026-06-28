@@ -638,8 +638,8 @@ jobs:
           esac
           BOT=/tmp/bottles/x86_64_linux
           rm -rf "$BOT"
-          mkdir -p "$BOT/akclip/$VERSION/bin"
-          cp "$SRC" "$BOT/akclip/$VERSION/bin/akclip"
+          mkdir -p "$BOT/$BIN/$VERSION/bin"
+          cp "$SRC" "$BOT/$BIN/$VERSION/bin/$BIN"
 
       - name: Build aarch64 binary
         env:
@@ -669,8 +669,8 @@ jobs:
           esac
           BOT=/tmp/bottles/arm64_linux
           rm -rf "$BOT"
-          mkdir -p "$BOT/akclip/$VERSION/bin"
-          cp "$SRC" "$BOT/akclip/$VERSION/bin/akclip"
+          mkdir -p "$BOT/$BIN/$VERSION/bin"
+          cp "$SRC" "$BOT/$BIN/$VERSION/bin/$BIN"
 
       - name: Pack x86_64 bottle
         id: bottle_x86
@@ -681,13 +681,13 @@ jobs:
         run: |
           set -euo pipefail
           BOT=/tmp/bottles/x86_64_linux
-          mkdir -p "$BOT/akclip/$VERSION/.brew"
-          if [ -f Formula/akclip.rb ]; then
-            cp Formula/akclip.rb "$BOT/akclip/$VERSION/.brew/akclip.rb"
+          mkdir -p "$BOT/$BIN/$VERSION/.brew"
+          if [ -f "Formula/$BIN.rb" ]; then
+            cp "Formula/$BIN.rb" "$BOT/$BIN/$VERSION/.brew/$BIN.rb"
           fi
 
           cd "$BOT"
-          tar czf "/tmp/${BIN}-${VERSION}.x86_64_linux.bottle.1.tar.gz" akclip
+          tar czf "/tmp/${BIN}-${VERSION}.x86_64_linux.bottle.1.tar.gz" "$BIN"
           SHA=$(sha256sum "/tmp/${BIN}-${VERSION}.x86_64_linux.bottle.1.tar.gz" | awk '{print $1}')
           echo "x86_64_linux sha256: $SHA"
 
@@ -708,13 +708,13 @@ jobs:
         run: |
           set -euo pipefail
           BOT=/tmp/bottles/arm64_linux
-          mkdir -p "$BOT/akclip/$VERSION/.brew"
-          if [ -f Formula/akclip.rb ]; then
-            cp Formula/akclip.rb "$BOT/akclip/$VERSION/.brew/akclip.rb"
+          mkdir -p "$BOT/$BIN/$VERSION/.brew"
+          if [ -f "Formula/$BIN.rb" ]; then
+            cp "Formula/$BIN.rb" "$BOT/$BIN/$VERSION/.brew/$BIN.rb"
           fi
 
           cd "$BOT"
-          tar czf "/tmp/${BIN}-${VERSION}.arm64_linux.bottle.1.tar.gz" akclip
+          tar czf "/tmp/${BIN}-${VERSION}.arm64_linux.bottle.1.tar.gz" "$BIN"
           SHA=$(sha256sum "/tmp/${BIN}-${VERSION}.arm64_linux.bottle.1.tar.gz" | awk '{print $1}')
           echo "arm64_linux sha256: $SHA"
 
