@@ -687,14 +687,14 @@ jobs:
           fi
 
           cd "$BOT"
-          tar czf "/tmp/akclip-${VERSION}.x86_64_linux.bottle.1.tar.gz" akclip
-          SHA=$(sha256sum "/tmp/akclip-${VERSION}.x86_64_linux.bottle.1.tar.gz" | awk '{print $1}')
+          tar czf "/tmp/${BIN}-${VERSION}.x86_64_linux.bottle.1.tar.gz" akclip
+          SHA=$(sha256sum "/tmp/${BIN}-${VERSION}.x86_64_linux.bottle.1.tar.gz" | awk '{print $1}')
           echo "x86_64_linux sha256: $SHA"
 
           # Stage for upload via the forgejo-release action.
           mkdir -p /tmp/release_assets/x86_64_linux
-          cp "/tmp/akclip-${VERSION}.x86_64_linux.bottle.1.tar.gz" \
-             "/tmp/release_assets/x86_64_linux/akclip-${VERSION}.x86_64_linux.bottle.1.tar.gz"
+          cp "/tmp/${BIN}-${VERSION}.x86_64_linux.bottle.1.tar.gz" \
+             "/tmp/release_assets/x86_64_linux/${BIN}-${VERSION}.x86_64_linux.bottle.1.tar.gz"
 
           {
             echo "sha256=$SHA"
@@ -715,13 +715,13 @@ jobs:
           fi
 
           cd "$BOT"
-          tar czf "/tmp/akclip-${VERSION}.arm64_linux.bottle.1.tar.gz" akclip
-          SHA=$(sha256sum "/tmp/akclip-${VERSION}.arm64_linux.bottle.1.tar.gz" | awk '{print $1}')
+          tar czf "/tmp/${BIN}-${VERSION}.arm64_linux.bottle.1.tar.gz" akclip
+          SHA=$(sha256sum "/tmp/${BIN}-${VERSION}.arm64_linux.bottle.1.tar.gz" | awk '{print $1}')
           echo "arm64_linux sha256: $SHA"
 
           mkdir -p /tmp/release_assets/arm64_linux
-          cp "/tmp/akclip-${VERSION}.arm64_linux.bottle.1.tar.gz" \
-             "/tmp/release_assets/arm64_linux/akclip-${VERSION}.arm64_linux.bottle.1.tar.gz"
+          cp "/tmp/${BIN}-${VERSION}.arm64_linux.bottle.1.tar.gz" \
+             "/tmp/release_assets/arm64_linux/${BIN}-${VERSION}.arm64_linux.bottle.1.tar.gz"
 
           {
             echo "sha256=$SHA"
