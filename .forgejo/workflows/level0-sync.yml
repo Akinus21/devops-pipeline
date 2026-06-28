@@ -8,6 +8,9 @@ on:
 jobs:
   sync-workflows:
     runs-on: rust-ci
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      !contains(github.event.head_commit.message, '[release-bot-skip]')
     steps:
       - name: Checkout current repo
         uses: actions/checkout@v4
