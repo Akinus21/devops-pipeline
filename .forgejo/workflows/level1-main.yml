@@ -290,7 +290,8 @@ jobs:
     needs: [detect, build-iterate]
     if: |
       needs.build-iterate.result == 'success' &&
-      contains(github.event.head_commit.message, '[release-bot-skip]') == false
+      contains(github.event.head_commit.message, '[release-bot-skip]') == false &&
+      needs.detect.outputs.language != 'other'
     runs-on: rust-ci
     outputs:
       version:    ${{ steps.bump.outputs.version }}
@@ -931,7 +932,12 @@ jobs:
   # ============================================================
   tidy:
     needs: [release, bottles]
-    if: needs.release.result == 'success' && needs.bottles.result == 'success'
+    # tidy should run on every successful level-1 push, regardless of
+    # whether release/bottles ran (they're skipped for language=other).
+    # Accept either 'success' or 'skipped' from each upstream job.
+    if: |
+      (needs.release.result == 'success' || needs.release.result == 'skipped') &&
+      (needs.bottles.result == 'success' || needs.bottles.result == 'skipped')
     runs-on: rust-ci
     steps:
       - name: Delete orphaned issue branches + toggle stale labels
