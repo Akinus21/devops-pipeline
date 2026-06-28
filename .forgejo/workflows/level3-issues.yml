@@ -203,11 +203,26 @@ jobs:
           if [ -n "$OPENCODE_MODEL" ]; then
             MODEL_ARG="--model $OPENCODE_MODEL"
           fi
-          opencode run "$(cat /tmp/triage.md)" \
-            --format default \
-            --pure \
-            --dangerously-skip-permissions \
-            $MODEL_ARG
+          for attempt in 1 2 3 4 5; do
+            echo "=== opencode triage attempt $attempt ==="
+            if opencode run "$(cat /tmp/triage.md)" \
+              --format default \
+              --pure \
+              --dangerously-skip-permissions \
+              $MODEL_ARG; then
+              echo "opencode triage succeeded"
+              break
+            else
+              rc=$?
+              echo "opencode triage failed with exit $rc (attempt $attempt of 5)"
+              if [ $attempt -lt 5 ]; then
+                sleep $((attempt * 5))
+              else
+                echo "all 5 attempts exhausted"
+                exit $rc
+              fi
+            fi
+          done
           if [ ! -s /tmp/triage.json ]; then
             echo "opencode did not write /tmp/triage.json - defaulting to skip"
             echo '{"action":"skip","branch_name":"","reason":"opencode produced no decision file"}' > /tmp/triage.json
@@ -434,11 +449,26 @@ jobs:
           if [ -n "$OPENCODE_MODEL" ]; then
             MODEL_ARG="--model $OPENCODE_MODEL"
           fi
-          opencode run "$(cat /tmp/fix.md)" \
-            --format default \
-            --pure \
-            --dangerously-skip-permissions \
-            $MODEL_ARG
+          for attempt in 1 2 3 4 5; do
+            echo "=== opencode fix attempt $attempt ==="
+            if opencode run "$(cat /tmp/fix.md)" \
+              --format default \
+              --pure \
+              --dangerously-skip-permissions \
+              $MODEL_ARG; then
+              echo "opencode fix succeeded"
+              break
+            else
+              rc=$?
+              echo "opencode fix failed with exit $rc (attempt $attempt of 5)"
+              if [ $attempt -lt 5 ]; then
+                sleep $((attempt * 5))
+              else
+                echo "all 5 attempts exhausted"
+                exit $rc
+              fi
+            fi
+          done
 
       - name: Commit and push
         id: commit
