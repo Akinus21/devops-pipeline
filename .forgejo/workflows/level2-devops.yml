@@ -131,7 +131,7 @@ jobs:
           print()
           print('1. Read the relevant source files. The build log points at the first error - trace it back to the offending code.')
           print('2. Make the minimal fix.')
-          print('3. After editing, run `cargo build --release` to confirm the fix. If you changed behavior, run `cargo test` too.')
+          print('3. After editing, run `cargo build --release && cargo test --release` to confirm the fix. Both build AND tests must pass.')
           print('4. Do not commit. The workflow commits and pushes the diff after opencode returns.')
           print()
           print('# Rules')
@@ -169,10 +169,10 @@ jobs:
 
             set +e
             case "${{ steps.detect.outputs.language }}" in
-              rust)   cargo build --release 2>&1 | tee /tmp/build.log ;;
-              go)     go build ./... 2>&1 | tee /tmp/build.log ;;
-              node)   npm run build 2>&1 | tee /tmp/build.log ;;
-              python) pip install -e . -q 2>&1 | tee /tmp/build.log ;;
+              rust)   cargo build --release 2>&1 | tee /tmp/build.log; cargo test --release 2>&1 | tee -a /tmp/build.log ;;
+              go)     go build ./... 2>&1 | tee /tmp/build.log; go test ./... 2>&1 | tee -a /tmp/build.log ;;
+              node)   npm ci 2>&1 | tee /tmp/build.log; npm test 2>&1 | tee -a /tmp/build.log ;;
+              python) pip install -e . -q 2>&1 | tee /tmp/build.log; python -m pytest 2>&1 | tee -a /tmp/build.log ;;
               *)      exit 1 ;;
             esac
             BUILD_RC=$?
