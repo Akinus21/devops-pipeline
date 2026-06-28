@@ -677,21 +677,22 @@ jobs:
         env:
           VERSION: ${{ needs.release.outputs.version }}
           TAG:     ${{ needs.release.outputs.tag }}
+          BIN:     ${{ needs.detect.outputs.bin_name }}
         run: |
           set -euo pipefail
-          VERSION="$VERSION"
           BOT=/tmp/bottles/x86_64_linux
+          rm -rf "$BOT"
+          mkdir -p "$BOT/akclip/$VERSION/.brew"
           if [ -f Formula/akclip.rb ]; then
-            mkdir -p "$BOT/akclip/$VERSION/.brew"
             cp Formula/akclip.rb "$BOT/akclip/$VERSION/.brew/akclip.rb"
           fi
+          cp target/release/$BIN "$BOT/akclip/$VERSION/bin/$BIN"
 
           cd "$BOT"
           tar czf "/tmp/${BIN}-${VERSION}.x86_64_linux.bottle.1.tar.gz" akclip
           SHA=$(sha256sum "/tmp/${BIN}-${VERSION}.x86_64_linux.bottle.1.tar.gz" | awk '{print $1}')
           echo "x86_64_linux sha256: $SHA"
 
-          # Stage for upload via the forgejo-release action.
           mkdir -p /tmp/release_assets/x86_64_linux
           cp "/tmp/${BIN}-${VERSION}.x86_64_linux.bottle.1.tar.gz" \
              "/tmp/release_assets/x86_64_linux/${BIN}-${VERSION}.x86_64_linux.bottle.1.tar.gz"
@@ -705,14 +706,16 @@ jobs:
         env:
           VERSION: ${{ needs.release.outputs.version }}
           TAG:     ${{ needs.release.outputs.tag }}
+          BIN:     ${{ needs.detect.outputs.bin_name }}
         run: |
           set -euo pipefail
-          VERSION="$VERSION"
           BOT=/tmp/bottles/arm64_linux
+          rm -rf "$BOT"
+          mkdir -p "$BOT/akclip/$VERSION/.brew"
           if [ -f Formula/akclip.rb ]; then
-            mkdir -p "$BOT/akclip/$VERSION/.brew"
             cp Formula/akclip.rb "$BOT/akclip/$VERSION/.brew/akclip.rb"
           fi
+          cp target/release/$BIN "$BOT/akclip/$VERSION/bin/$BIN"
 
           cd "$BOT"
           tar czf "/tmp/${BIN}-${VERSION}.arm64_linux.bottle.1.tar.gz" akclip
