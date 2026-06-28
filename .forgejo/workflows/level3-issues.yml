@@ -331,6 +331,10 @@ jobs:
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_BODY: ${{ github.event.issue.body }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
+          # Comma-separated list of label names from the event payload.
+          # Used by the prompt builder to switch between bug (fix) and
+          # enhancement (implement) modes.
+          ISSUE_LABELS: ${{ join(github.event.issue.labels.*.name, ',') }}
           FORGEJO_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -349,6 +353,10 @@ jobs:
           title = os.environ.get('ISSUE_TITLE', '')
           body = os.environ.get('ISSUE_BODY', '')
           number = os.environ.get('ISSUE_NUMBER', '0')
+          labels_raw = os.environ.get('ISSUE_LABELS', '')
+          labels = {x.strip().lower() for x in labels_raw.split(',') if x.strip()}
+          mode = 'enhancement' if 'enhancement' in labels else ('bug' if 'bug' in labels else 'other')
+
           with open('/tmp/comments.json') as f:
               data = json.load(f)
           comments_md = '(no comments)'
@@ -361,10 +369,22 @@ jobs:
                       out.append('--- comment ' + str(i) + ' by ' + u + ' ---\n' + b)
               if out:
                   comments_md = '\n\n'.join(out)
+
           print('# Task')
           print()
-          print('You are fixing a GitHub issue in this Rust project.')
-          print('Read the codebase as needed using your tools, then make the minimal, correct code change.')
+          if mode == 'bug':
+              print('You are fixing a bug in this codebase.')
+              print('Find the root cause of the bug described in the issue, then make the minimal, correct code change that fixes it.')
+          elif mode == 'enhancement':
+              print('You are implementing a new feature in this codebase.')
+              print('The issue below is a feature specification. Implement the feature so that the codebase does what the issue describes.')
+              print('If the codebase is essentially empty (just a stub `main.rs` or scaffold), scaffold the project structure according to the spec: create the modules, types, and entry points that the feature needs.')
+              print('Aim for a working, compilable implementation that demonstrates the core flow described in the issue. Do not stub out major pieces - if the spec asks for a taxonomy module, write one.')
+              print('It is OK if the implementation is large - features often span multiple files. Write the code that the spec actually calls for, not a placeholder.')
+          else:
+              print('You are addressing a GitHub issue in this codebase.')
+              print('Read the codebase as needed using your tools, then make the change that best resolves the issue.')
+          print()
           print('Do not write a JSON response. Edit files directly using your `edit` / `write` tools.')
           print()
           print('# Issue #' + number)
@@ -381,18 +401,30 @@ jobs:
           print()
           print('# Workflow')
           print()
-          print('1. Read the relevant source files (start with `Cargo.toml`, `src/main.rs`, and any `src/clipboard/*.rs` files).')
-          print('2. Make the minimal change that addresses the issue. Edit files in place.')
-          print('3. After editing, run `cargo build --release` to confirm it compiles. If you changed behavior, also run `cargo test`.')
-          print('4. Fix any errors that come up. Do not commit - the workflow will commit your changes.')
+          if mode == 'bug':
+              print('1. Read the relevant source files to understand the codebase.')
+              print('2. Locate the root cause of the bug. Trace it from any symptoms in the issue back to the offending code.')
+              print('3. Make the minimal change that fixes the bug. Edit files in place.')
+              print('4. After editing, run the project build (e.g. `cargo build --release` for Rust, `npm run build` for Node) to confirm it compiles. If you changed behavior, also run the test suite.')
+              print('5. Fix any errors that come up. Do not commit - the workflow will commit your changes.')
+          else:
+              print('1. Read the existing source files to understand the project layout and language conventions.')
+              print('2. Plan the implementation: which files to create, which to modify, which dependencies (if any) to add to `Cargo.toml` / `package.json` / `pyproject.toml`.')
+              print('3. Write the code. Create new modules, types, and functions as the spec requires.')
+              print('4. After editing, run the project build (e.g. `cargo build --release` for Rust, `npm run build` for Node) to confirm it compiles. If you can also run tests, do so.')
+              print('5. Fix any compilation errors that come up. Do not commit - the workflow will commit your changes.')
           print()
           print('# Rules')
           print()
-          print('- Make the minimal change that resolves the issue. Do not refactor unrelated code.')
-          print('- Match the existing code style (use tabs as in `cargo fmt` would produce; check existing files).')
+          if mode == 'bug':
+              print('- Make the minimal change that fixes the bug. Do not refactor unrelated code.')
+          else:
+              print('- Implement the feature as described in the issue. A complete-but-rough implementation is better than a minimal-stub one.')
+              print('- You may add new files, new modules, and new dependencies as needed.')
+              print('- Match the existing code style (use tabs as in `cargo fmt` would produce; check existing files for conventions).')
           print('- If the issue is ambiguous or cannot be addressed by code changes, leave a TODO comment in a sensible place and explain in a final assistant message - the workflow will still commit.')
           print('- Do NOT edit `AGENTS.md`, `.forgejo/workflows/*`, or `Formula/*` - those are managed by the release pipeline.')
-          print('- Do NOT modify `Cargo.toml` version (the release pipeline owns that).')
+          print('- Do NOT modify `Cargo.toml` / `package.json` / `pyproject.toml` version field (the release pipeline owns that). You may add dependencies.')
           PYEOF
 
       - name: Run opencode fix
