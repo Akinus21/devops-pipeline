@@ -1,72 +1,87 @@
-# AKClip – Rust Clipboard Utility – Agent Instructions
+# DevOps Pipeline — CI/CD Template Repository
 
 ## Overview
-**AKClip** is a lightweight, cross‑platform command‑line tool for reading from and writing to the system clipboard.  
-It provides a single binary (`akclip`) that can be installed via Homebrew, Docker, or directly from the compiled release.
+**DevOps Pipeline** is a 3-level CI/CD pipeline template for Forgejo Actions. It provides a plug-and-play workflow suite (level0-sync, level1-main, level2-devops, level3-issues) that propagates to any repository via the installer. The pipeline is language-aware (Rust, Go, Node, Python) and fully configurable via repo variables.
+
+This repository is the **canonical source of truth** for the workflow templates. Every repository that runs the installer gets its workflows synced from here automatically via level0-sync.
 
 ## Project Purpose
-- **Read** the current clipboard contents and output to stdout.  
-- **Write** text supplied via stdin (or a file) to the clipboard.  
-- Support macOS, Linux, and Windows (via platform‑specific commands or APIs).  
+- Provide a reusable, multi-language CI/CD pipeline template
+- Enable AI-assisted issue triage and auto-fix via `opencode` CLI
+- Support Homebrew bottle builds and optional external tap sync
+- Maintain a single source of truth for workflow files across all consumer repos
 
 ## Architecture
-- **Platform modules** (`src/clipboard/*.rs`) implement `get_clipboard` and `set_clipboard` using native tools (`pbpaste/pbcopy` on macOS, `xclip`/`wl-copy` on Linux, `powershell` on Windows).  
-- **CLI entry point** (`src/main.rs`) parses command‑line arguments, selects the appropriate platform module via `#[cfg]`, and forwards data.  
-- **Configuration** (e.g., custom clipboard commands) can be overridden via environment variables.
+The pipeline is split across four workflow files, each scoped to one branch layer. Push events route to the right workflow by branch filter — no runtime branch-type detection needed.
 
-## CI/CD Pipeline — 3-Level Architecture
+- **Level 0** — Template sync: propagates workflow files from this repo to all consumers
+- **Level 1** — Main: build, release (bump + cut), bottles, formula, tidy
+- **Level 2** — Devops: build, PR to main, close-merged-issue
+- **Level 3** — Issues: triage, auto-fix, build, PR to devops
 
-The pipeline is split across three workflow files, each scoped to one branch layer. Push events route to the right workflow by branch filter; no runtime branch-type detection.
+All workflows are **language-aware** (Rust / Go / Node / Python) and **configurable** via Forgejo repo variables.
 
-The workflows are **language-aware** (Rust / Go / Node / Python) and **configurable** via Forgejo repo variables (Settings → Actions → Variables). See [Configuration](#configuration-via-repo-variables) below.
+## Level 0 — Template Sync (`.forgejo/workflows/level0-sync.yml`)
 
-### Level 3 — Issues (`.forgejo/workflows/level3-issues.yml`)
-Triggers on `issues: [opened, edited, labeled, unlabeled]` and `push.branches: ['<ISSUE_PREFIX>*']`.
+Runs on every push to `main` in every consumer repo (including this one).
 
-- **label_check** — only the issues with a `bug` or `enhancement` label are eligible for auto-fix. Returns `relevant=true|false`.
-- **triage** — runs only when `label_check.relevant=true`. Builds a Markdown prompt and hands the issue (title + body + comments) to the `opencode` CLI, which reads the codebase and writes a JSON decision to `/tmp/triage.json` (`{action, branch_name, reason}`). Falls back to `action=skip` if the file is missing.
-- **comment** — posts acknowledgement when action is `comment`.
-- **skip-notify** — when action is `skip`, posts a comment on the issue with the AI's `reason` so the user understands why nothing happened.
-- **create-fix-branch** — when action is `fix`: creates `<ISSUE_PREFIX>N` branched off `<DEVOPS_BRANCH>`, hands the full issue to `opencode run`, which edits files in place. The workflow then `git add`s everything, commits, and pushes. A subsequent PR is opened from the same job.
-- **build-iterate** — runs on push to `<ISSUE_PREFIX>*` branches: build + test, AI-fix retry loop (3 attempts) on failure.
-- **create-pr** — opens `<ISSUE_PREFIX>N → <DEVOPS_BRANCH>` PR (idempotent). The same PR is also opened directly from `create-fix-branch` so the issue event itself closes the loop.
+1. Clones this repository (`devops-pipeline`) using the configured source URL.
+2. Rewrites branch-name literals in the template workflows using `sed` (matching `install.sh`'s rules).
+3. Diffs the rewritten templates against the consumer repo's local `.forgejo/workflows/`.
+4. If any workflow changed, commits and pushes the update.
 
-### Level 2 — Devops (`.forgejo/workflows/level2-devops.yml`)
-Triggers on `push.branches: ['<DEVOPS_BRANCH>']`.
+When run against devops-pipeline itself, the clone is a no-op since template equals local. This means changes to the workflow files in this repo automatically propagate to all repos that have the pipeline installed.
 
-- **detect / build-iterate** — language-aware build + test, 3-attempt AI-fix loop (opencode edits files; workflow commits and pushes the diff).
-- **create-pr** — opens `<DEVOPS_BRANCH> → <MAIN_BRANCH>` PR.
-- **close-merged-issue** — scans commits on this branch for `Fixes #N` / `Closes #N` markers, comments + closes each referenced issue.
-
-### Level 1 — Main (`.forgejo/workflows/level1-main.yml`)
+## Level 1 — Main (`.forgejo/workflows/level1-main.yml`)
 Triggers on `push.branches: ['<MAIN_BRANCH>']`.
 
-- **detect** — single source of truth for language / binary name / version. All other jobs depend on it.
-- **build-iterate** — skipped if latest commit has the skip marker (avoids redundant builds on bump commits). Otherwise: build + test, 3-attempt AI-fix loop.
-- **release** — needs successful build. **Bumps the version file first, commits + pushes with the skip marker, then cuts the release on the new commit.** Tag format: `v<version>` (e.g. `v0.0.37`), not commit SHA. Release notes are generated by `opencode` reading the commit log.
-- **bottles** — needs release. Builds precompiled Linux bottles for `x86_64` (native) and `arm64` (cross-compiled via `gcc-aarch64-linux-gnu`), uploads them as release assets. Only runs for languages with a single binary artifact (Rust, Go).
-- **formula-update** — needs release + bottles. Renders `Formula/<bin>.rb` with explicit `root_url` and per-platform sha256s, commits in-repo with the skip marker, optionally syncs to an external tap repo (`vars.BREW_TAP_REPO`).
-- **tidy** — needs release + bottles. Deletes orphaned `<ISSUE_PREFIX>*` branches (issue closed, no open PR). Toggles `stale` label on `bug`/`enhancement` issues older than 30 days.
+- **detect** — Single source of truth for language / binary name / version. All other jobs depend on it.
+- **build-iterate** — Skipped if latest commit has the skip marker. Otherwise: build + test, 3-attempt AI-fix loop.
+- **release** — Needs successful build. **Bumps the version file first, commits + pushes with the skip marker, then cuts the release on the new commit.** Tag format: `v<version>` (e.g. `v1.2.3`), not commit SHA. Release notes are generated by `opencode` reading the commit log.
+- **bottles** — Needs release. Builds precompiled Linux bottles for `x86_64` (native) and `arm64` (cross-compiled via `gcc-aarch64-linux-gnu`), uploads them as release assets. Only runs for languages with a single binary artifact (Rust, Go).
+- **formula-update** — Needs release + bottles. Renders `Formula/<bin>.rb` with explicit `root_url` and per-platform sha256s, commits in-repo with the skip marker, optionally syncs to an external tap repo.
+- **tidy** — Needs release + bottles. Deletes orphaned `<ISSUE_PREFIX>*` branches (issue closed, no open PR). Toggles `stale` label on `bug`/`enhancement` issues older than 30 days.
 
-### AI integration — `opencode` CLI
-
-The three workflows use the local `opencode` binary (the same one that powers this agent) to read the codebase, decide what to change, and edit files directly. There is no JSON roundtrip and no helper script: the workflow writes a Markdown prompt to a temp file, then runs `opencode run "$(cat /tmp/prompt.md)" --format default --pure --dangerously-skip-permissions` (with optional `--model $OPENCODE_MODEL`).
-
-The triage job is the only exception: it tells opencode to write its decision to `/tmp/triage.json`, which the workflow then reads. Triage does not modify any files in the repo.
-
-The release job uses opencode to read the commit log and write release notes to `/tmp/release_notes.txt`. There is no JSON contract anywhere — opencode's regular `read` / `edit` / `write` / `bash` tools are the interface.
-
-### Recursion guard
+### Recursion Guard
 The `[release-bot-skip]` marker on commit messages causes:
 - `build-iterate` in level 1 to skip entirely.
 - `release` in level 1 to skip entirely.
 
 So when level 1's release job pushes the bump commit, the resulting CI run is a no-op for that workflow.
 
-### Level 0 — Template sync
-Every repo (including devops-pipeline itself) runs `level0-sync.yml` on every push to `main`. It clones `devops-pipeline`, rewrites the template workflows with per-repo branch names (matching `install.sh`'s sed rules), diffs against the local workflows, and commits + pushes any updates. This makes `devops-pipeline` the single source of truth for all three workflow files — bug fixes, new features, and variable changes flow from the template to each repo automatically. When run against devops-pipeline itself, the clone is a no-op since template equals local.
+## Level 2 — Devops (`.forgejo/workflows/level2-devops.yml`)
+Triggers on `push.branches: ['<DEVOPS_BRANCH>']`.
 
-## Configuration via repo variables
+- **detect / build-iterate** — Language-aware build + test, 3-attempt AI-fix loop (opencode edits files; workflow commits and pushes the diff).
+- **create-pr** — Opens `<DEVOPS_BRANCH> → <MAIN_BRANCH>` PR.
+- **close-merged-issue** — Scans commits on this branch for `Fixes #N` / `Closes #N` markers, comments + closes each referenced issue.
+
+## Level 3 — Issues (`.forgejo/workflows/level3-issues.yml`)
+Triggers on `issues: [opened, edited, labeled, unlabeled]` and `push.branches: ['<ISSUE_PREFIX>*']`.
+
+- **label_check** — Only issues with a `bug` or `enhancement` label are eligible for auto-fix. Returns `relevant=true|false`.
+- **triage** — Runs only when `label_check.relevant=true`. Builds a Markdown prompt and hands the issue (title + body + comments) to the `opencode` CLI, which reads the codebase and writes a JSON decision to `/tmp/triage.json` (`{action, branch_name, reason}`). Falls back to `action=skip` if the file is missing.
+- **comment** — Posts acknowledgement when action is `comment`.
+- **skip-notify** — When action is `skip`, posts a comment on the issue with the AI's `reason` so the user understands why nothing happened.
+- **create-fix-branch** — When action is `fix`: creates `<ISSUE_PREFIX>N` branched off `<DEVOPS_BRANCH>`, hands the full issue to `opencode run`, which edits files in place. The workflow then `git add`s everything, commits, and pushes. A subsequent PR is opened from the same job.
+- **build-iterate** — Runs on push to `<ISSUE_PREFIX>*` branches: build + test, AI-fix retry loop (3 attempts) on failure.
+- **create-pr** — Opens `<ISSUE_PREFIX>N → <DEVOPS_BRANCH>` PR (idempotent). The same PR is also opened directly from `create-fix-branch` so the issue event itself closes the loop.
+
+## AI Integration — `opencode` CLI
+
+The workflows use the local `opencode` binary (the same one that powers this agent) to read the codebase, decide what to change, and edit files directly. There is no JSON roundtrip and no helper script: the workflow writes a Markdown prompt to a temp file, then runs:
+
+```
+opencode run "$(cat /tmp/prompt.md)" --format default --pure --dangerously-skip-permissions
+```
+
+(with optional `--model $OPENCODE_MODEL`).
+
+The triage job is the only exception: it tells opencode to write its decision to `/tmp/triage.json`, which the workflow then reads. Triage does not modify any files in the repo.
+
+The release job uses opencode to read the commit log and write release notes to `/tmp/release_notes.txt`. There is no JSON contract anywhere — opencode's regular `read` / `edit` / `write` / `bash` tools are the interface.
+
+## Configuration via Repo Variables
 
 All knobs are Forgejo repo variables (Settings → Actions → Variables). Every variable has a sensible default baked into the workflow, so the pipeline runs out-of-the-box with zero configuration.
 
@@ -75,8 +90,8 @@ All knobs are Forgejo repo variables (Settings → Actions → Variables). Every
 | `BOT_NAME` | `devops-bot` | Git committer name for bot commits |
 | `BOT_EMAIL` | `devops-bot@akinus21.com` | Git committer email |
 | `OPENCODE_MODEL` | _(empty)_ | Optional `opencode run --model` override. Empty → runner's configured default |
-| `SKIP_MARKER` | `[release-bot-skip]` | Commit message marker that suppresses release/build-iterate (hardcoded; not configurable) |
-| `MAIN_BRANCH` | `main` | Production / release branch (templated at install time; not changeable post-install) |
+| `SKIP_MARKER` | `[release-bot-skip]` | Commit message marker that suppresses release/build-iterate |
+| `MAIN_BRANCH` | `main` | Production / release branch (templated at install time) |
 | `DEVOPS_BRANCH` | `devops` | Staging branch (templated at install time) |
 | `ISSUE_BRANCH_PREFIX` | `issue-` | Prefix for AI-generated issue branches (templated at install time) |
 | `BREW_TAP_ENABLED` | `false` | Enable formula + bottle updates |
@@ -84,10 +99,18 @@ All knobs are Forgejo repo variables (Settings → Actions → Variables). Every
 | `BREW_TAP_BRANCH` | `main` | Tap branch |
 | `SOURCE_BIN_NAME` | _(auto)_ | Override the auto-detected binary name |
 
-## Reusing the pipeline on another project
+## Install Script (`install.sh`)
 
-The three workflow files plus `install.sh` make the pipeline plug-and-play:
+The installer copies the workflow templates into a target repository and rewrites branch-name literals using `sed`.
 
+### What it does:
+1. Clones (or uses existing) the target repo.
+2. Creates `<DEVOPS_BRANCH>` if missing.
+3. Copies `.forgejo/workflows/{level0-sync,level1-main,level2-devops,level3-issues}.yml` and rewrites branch-name literals via `sed`.
+4. Optionally writes a `Formula/<name>.rb` stub (with `WITH_FORMULA=1`).
+5. Commits and pushes to `<DEVOPS_BRANCH>`.
+
+### Usage:
 ```bash
 # Install into an existing local repo
 ./install.sh /path/to/another-project
@@ -102,153 +125,80 @@ WITH_FORMULA=1 ./install.sh /path/to/another-project
 DEV_BRANCH=staging MAIN_BRANCH=production ./install.sh /path/to/another-project
 ```
 
-The installer:
-1. Clones (or uses existing) the target repo.
-2. Creates `<DEVOPS_BRANCH>` if missing.
-3. Copies `.forgejo/workflows/{level0-sync,level1-main,level2-devops,level3-issues}.yml` and rewrites branch-name literals.
-4. Optionally writes a `Formula/<name>.rb` stub (with `WITH_FORMULA=1`).
-5. Commits and pushes to `<DEVOPS_BRANCH>`.
+## Reusing the Pipeline
 
-After install, configure repo variables and (only if you use a homebrew tap) the secret `TAP_TOKEN` in the target repo's Forgejo UI. The runner host must have a runner registered with the label `rust-ci` pointing at a Docker image that has `rustc`, `cargo`, `opencode`, `jq`, `git`, and `curl` pre-installed (see `Dockerfile.rust-ci` in the devops repo for an example). The `forgejo-actions` auto-token must also be enabled on the runner so `${{ github.token }}` resolves to a usable token for in-repo operations.
+After running `install.sh`, configure the following in the target repo:
 
-### Language support
+1. **Repo variables** — Set any desired overrides (see [Configuration via Repo Variables](#configuration-via-repo-variables)).
+2. **Runner** — The runner host must have a runner registered with the label matching your language (e.g., `rust-ci`) pointing at a Docker image with the toolchain pre-installed (`rustc`, `cargo`, `opencode`, `jq`, `git`, `curl` for Rust; similar stacks for Go, Node, Python).
+3. **TAP_TOKEN secret** — Only required if using an external Homebrew tap. Add as a repository secret (Settings → Actions → Secrets).
+4. **forgejo-actions** — The `forgejo-actions` auto-token must be enabled on the runner so `${{ github.token }}` resolves to a usable token for in-repo operations.
 
-The workflows auto-detect Rust, Go, Node, and Python from the presence of `Cargo.toml`, `go.mod`, `package.json`, `pyproject.toml` / `setup.py`. For other languages the build steps log a "no build configured" message and skip — add support by extending the `case` statements in `level1-main.yml` (and the matching steps in level2 / level3).
+## Language Support
 
-### Validated end-to-end (akclip)
+The workflows auto-detect the language from the presence of project files:
 
-Level 1 of this pipeline was validated end-to-end on commit `a14293e` (push to `main`). All jobs ran green: `detect` → `build-iterate` → `release` (bumped 0.0.79 → 0.0.80, cut release, uploaded akclip asset) → `bottles` (x86_64 + arm64 Linux bottles uploaded) → `tidy`. See the commit log for the actual run IDs.
+| Language | Detection file | Build command | Version source |
+|---|---|---|---|
+| Rust | `Cargo.toml` | `cargo build --release` | `version` in `Cargo.toml` |
+| Go | `go.mod` | `go build -o <bin> .` | _(no version bump)_ |
+| Node | `package.json` | _(not configured by default)_ | `version` in `package.json` |
+| Python | `pyproject.toml` / `setup.py` | _(not configured by default)_ | `version` in `pyproject.toml` |
 
-The version-source dispatch reads from:
-- Rust: `Cargo.toml`
-- Node: `package.json`
-- Python: `pyproject.toml`
-- Go / other: skipped (no version bump)
+For other languages the build steps log a "no build configured" message and skip. Add support by extending the `case` statements in `level1-main.yml` (and the matching steps in level2 / level3).
 
-Binary name is auto-detected from the same sources.
+Binary name is auto-detected from the same sources (or via `SOURCE_BIN_NAME` override).
 
 ## Key Files & Directories
+
 ```
-akclip/
-├── Cargo.toml                # Crate metadata, version, dependencies
-├── README.md                 # User documentation
-├── AGENTS.md                 # This file – agent instructions
-├── install.sh                # Installer for reusing the pipeline on other repos
-├── .gitignore                # Excludes /target, *.log, scratch files
-├── .forgejo/                 # CI/CD workflows (3-level architecture)
-│   └── workflows/
-│       ├── level0-sync.yml      # Level 0: sync workflow files from devops-pipeline template
-│       ├── level1-main.yml       # Level 1: build, release (bump+cut), bottles, formula, tidy
-│       ├── level2-devops.yml     # Level 2: build, PR to main, close-merged-issue
-│       └── level3-issues.yml     # Level 3: triage, auto-fix, build, PR to devops
-├── Formula/                  # Homebrew formula (auto-updated by level1-main.yml, in-repo)
-└── src/
-    ├── main.rs               # CLI entry point
-    └── clipboard/
-        ├── mod.rs            # Public interface
-        ├── macos.rs          # macOS implementation
-        ├── linux.rs          # Linux implementation
-        └── windows.rs        # Windows implementation
+devops-pipeline/
+├── AGENTS.md                     # This file — agent instructions
+├── README.md                     # User documentation
+├── install.sh                    # Installer for reusing the pipeline on other repos
+├── .gitignore                    # Excludes scratch files
+└── .forgejo/
+    └── workflows/
+        ├── level0-sync.yml       # Level 0: sync workflow files from devops-pipeline template
+        ├── level1-main.yml       # Level 1: build, release (bump+cut), bottles, formula, tidy
+        ├── level2-devops.yml     # Level 2: build, PR to main, close-merged-issue
+        └── level3-issues.yml     # Level 3: triage, auto-fix, build, PR to devops
 ```
 
-## Build System
-- **Language:** Rust  
-- **Build command:** `cargo build --release`  
-- **Binary name:** `akclip`  
-- **Binary location after build:** `target/release/akclip`  
-- **Version source:** `Cargo.toml` (update the `version = "x.y.z"` field for releases)
+This repository contains **no application source code** — only the pipeline templates and installer.
 
-### Local Build (for debugging)
-```bash
-cd /var/home/gabriel/Projects/akclip
-cargo build --release
-./target/release/akclip --help
-```
+## Secrets & Configuration Management
 
-> **NOTE:** Do **not** install Rust on the host machine for normal development. CI runs the build automatically. Use the local build only for quick sanity checks.
-
-## CI / Webhook Integration
-- **GitHub Actions** runs on every push, executing the build command above.
-- **Webhook endpoint:** `https://webhook.akinus21.com/webhook/akclip-build`
-- **Webhook secret:** `4d82982b0a0010a706a40cf272f49c9ddfee93162a2c4b714eebc6ded10038f5`
-- The CI pipeline posts build status and artifacts to the webhook for downstream deployment (e.g., Homebrew tap update).
-
-## Homebrew Distribution
-- **Tap repo:** `akinus/homebrew-akinus21-forge` — that's where users actually install from. Level 1's `release` job pushes the rendered formula to this repo (gated by `vars.BREW_TAP_ENABLED == 'true'` AND `vars.TAP_REPO` being set). If `TAP_REPO` is unset, only the in-repo `Formula/akclip.rb` is updated.
-- The in-repo `Formula/akclip.rb` is also regenerated each release for symmetry / single-source-of-truth.
-- Users install via:
-  ```bash
-  brew tap akinus/forgejo https://forge.akinus21.com/akinus/homebrew-akinus21-forge.git
-  brew install akinus/forgejo/akclip
-  ```
+- **SSH key** for Git operations: `/home/akinus/.ssh/github`
+- **Project-specific secrets** (e.g., API tokens) are stored on the runner host at `/home/akinus/docker/devops-stack/.secrets`. Consumer repos may contain a symlink `.secrets` pointing to that location. Do **not** commit real secrets; rely on the symlink.
 
 ## Git Push Workflow
+
 The `gh` CLI is not authenticated in the CI environment, so use SSH directly with the provided key.
 
 ```bash
-cd /var/home/gabriel/Projects/akclip
 git add -A
 git commit -m "<description>"
 GIT_SSH_COMMAND="ssh -i /home/akinus/.ssh/github -o StrictHostKeyChecking=no" \
 git push origin main
 ```
 
-**Always push** after verifying changes; the CI will automatically run the build and webhook steps.
-
-## Secrets & Configuration Management
-- **SSH key** for Git operations: `/home/akinus/.ssh/github`
-- **Project‑specific secrets** (e.g., API tokens for the webhook) are stored on the runner host at `/home/akinus/docker/devops-stack/.secrets`. The repository contains a symlink `.secrets` pointing to that location. Do **not** commit real secrets; rely on the symlink.
-
-## Documentation Updates
-Whenever you add features, change CLI flags, or modify platform behavior:
-
-1. **Update `README.md`** with:
-   - New command‑line options.
-   - Example usage for each OS.
-   - Installation instructions (Cargo, Homebrew, Docker).
-2. **Add or adjust** any relevant comments in `src/clipboard/*.rs` to keep the code self‑documenting.
-3. **Run `cargo doc --open`** locally to verify generated docs (optional).
-
-## Conventions & Best Practices
-- **Error handling:** Return `Result<(), String>` from clipboard functions; propagate errors to the CLI with clear messages.
-- **Logging:** Use `eprintln!` for user‑visible errors; avoid noisy debug prints in release builds.
-- **Testing:** Add unit tests under `src/clipboard/tests.rs` using `#[cfg(test)]`. CI runs `cargo test --release`.
-- **Formatting:** Run `cargo fmt` before committing.
-- **Linting:** Enforce `cargo clippy` warnings as errors in CI (`cargo clippy -- -D warnings`).
-
-
 ## External Tap Sync
 
-The `formula-update` job automatically updates `Formula/<bin>.rb`
-in the external Homebrew tap repo (`vars.BREW_TAP_REPO`). It uses
-the `TAP_TOKEN` secret (a personal API token with write access to
-the tap repo) to push directly to the tap repo's main branch.
+The `formula-update` job automatically updates `Formula/<bin>.rb` in the external Homebrew tap repo (`vars.BREW_TAP_REPO`). It uses the `TAP_TOKEN` secret (a personal API token with write access to the tap repo) to push directly to the tap repo's main branch.
 
-**Why a separate token?** Forgejo Actions attributes all CI pushes
-to the `forgejo-actions` pseudo-user, which can't push cross-repo
-without explicit collaborator permission on the target repo.
-Using a personal token (which has the user's push rights) avoids
-this restriction.
+**Why a separate token?** Forgejo Actions attributes all CI pushes to the `forgejo-actions` pseudo-user, which can't push cross-repo without explicit collaborator permission on the target repo. Using a personal token (which has the user's push rights) avoids this restriction.
 
 **Token strategy across the pipeline:**
-- **In-repo writes** (release API, asset upload, PR creation, branch
-  deletion, label toggling, comment posting, branch pushes) use
-  `${{ github.token }}` — the `forgejo-actions` auto-user. Requires
-  `forgejo-actions` to be enabled on the runner. No extra secret needed.
-- **Cross-repo writes** (the external homebrew tap) use
-  `secrets.TAP_TOKEN` — a maintainer's PAT scoped to the tap repo.
+- **In-repo writes** (release API, asset upload, PR creation, branch deletion, label toggling, comment posting, branch pushes) use `${{ github.token }}` — the `forgejo-actions` auto-user. Requires `forgejo-actions` to be enabled on the runner. No extra secret needed.
+- **Cross-repo writes** (the external homebrew tap) use `secrets.TAP_TOKEN` — a maintainer's PAT scoped to the tap repo.
 
 To configure:
-1. Create an API token in your Forgejo user settings with
-   `write:repository` scope (Settings → Applications → Generate Token).
-2. Add it as a repository secret named `TAP_TOKEN` (Settings →
-   Actions → Secrets).
+1. Create an API token in your Forgejo user settings with `write:repository` scope (Settings → Applications → Generate Token).
+2. Add it as a repository secret named `TAP_TOKEN` (Settings → Actions → Secrets).
 3. Set the repo variable `BREW_TAP_REPO` to `owner/tap-repo-name`.
 4. Set `BREW_TAP_BRANCH` (default: `main`) and `BREW_TAP_ENABLED=true`.
 
-The tap host is derived from `github.server_url` so the workflow
-works on any Forgejo/Gitea host (not just `forge.akinus21.com`).
+The tap host is derived from `github.server_url` so the workflow works on any Forgejo/Gitea host.
 
 *End of AGENTS.md*
-
-(trigger level1 test with TAP_TOKEN)
