@@ -409,6 +409,7 @@ jobs:
             $MODEL_ARG
 
       - name: Commit and push
+        id: commit
         run: |
           set -euo pipefail
           BRANCH="${{ needs.triage.outputs.branch_name }}"
@@ -418,16 +419,33 @@ jobs:
           if ! git diff --staged --quiet; then
             # Include 'Fixes #N' so the level2 close-merged-issue job
             # can find this issue when the devops->main PR merges.
-            # The create-fix-branch job below also closes the issue
-            # directly via the API (belt-and-suspenders).
+            # The Close issue + Open PR steps below use this output to
+            # decide whether to act (skipped if the AI produced nothing).
             git commit -m "fix(ai): Fixes #${{ github.event.issue.number }} [release-bot-skip]"
             git push origin "$BRANCH"
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
           else
             echo "AI produced no changes; nothing to commit."
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Comment when AI produced no changes
+        if: steps.commit.outputs.pushed != 'true'
+        env:
+          FORGEJO_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ISSUE_NUM="${{ github.event.issue.number }}"
+          echo "Posting comment on issue #$ISSUE_NUM (AI could not produce a fix)"
+          jq -n --arg body "Auto-triage: I tried to generate a fix for this issue but couldn't produce a usable code change. A human maintainer will need to look at this manually. The 'bug' or 'enhancement' label can be removed and re-added to retry." \
+            '{body:$body}' > /tmp/c.json
+          curl -s -X POST \
+            "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUM/comments" \
+            -H "Authorization: token $FORGEJO_TOKEN" \
+            -H "Content-Type: application/json" -d @/tmp/c.json > /dev/null
+
       - name: Close issue with summary
-        if: success()
+        if: steps.commit.outputs.pushed == 'true'
         env:
           FORGEJO_TOKEN: ${{ github.token }}
         run: |
@@ -454,8 +472,12 @@ jobs:
       # separate build-iterate step (which runs on push events) is
       # left in place for non-AI pushes (e.g., a human iterating on
       # the issue branch).
+      #
+      # Skip this step when the AI produced no changes - the branch
+      # was never pushed, so any attempt to open a PR with this head
+      # ref would fail with 'target couldn't be found'.
       - name: Open PR issue-N -> devops
-        if: success()
+        if: steps.commit.outputs.pushed == 'true'
         env:
           FORGEJO_TOKEN: ${{ github.token }}
           BRANCH: ${{ needs.triage.outputs.branch_name }}
