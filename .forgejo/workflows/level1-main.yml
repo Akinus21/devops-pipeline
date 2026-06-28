@@ -1,0 +1,1025 @@
+name: Level 1 — Main
+
+on:
+  push:
+    branches: [main]  # edit if your default branch is named differently
+
+# Workflow-level env. All values default if their corresponding
+# repo variable is unset; users configure via Forgejo repo
+# variables (Settings → Actions → Variables).
+#
+#   vars.BOT_NAME           - Git identity for bot commits
+#   vars.BOT_EMAIL          - Git email for bot commits
+#   vars.MAIN_BRANCH        - Branch treated as 'main' (default: main).
+#                             NOTE: only used inside job steps; the
+#                             on.push.branches filter above is a
+#                             literal 'main' that the install script
+#                             rewrites to your value at install time.
+#   vars.DEVOPS_BRANCH      - Same constraint as MAIN_BRANCH.
+#   vars.ISSUE_BRANCH_PREFIX - Same constraint.
+#   vars.BREW_TAP_ENABLED   - 'true' to enable formula + bottle
+#                             updates (default: false)
+#   vars.BREW_TAP_REPO      - owner/name of the homebrew tap
+#                             (e.g. akinus/homebrew-akinus21-forge)
+#   vars.BREW_TAP_BRANCH    - Tap branch (default: main)
+#   vars.SOURCE_BIN_NAME    - Override the auto-detected binary name
+#   vars.OPENCODE_MODEL     - Optional model override for `opencode run --model`.
+#                            If unset, opencode uses its configured default.
+#
+# The AI integration uses the local `opencode` CLI. opencode has full
+# file-tool access: it reads the codebase itself, decides what to
+# change, and edits files directly. The workflow then commits the
+# diff. This is the single source of truth for the auto-fix path
+# on this branch.
+#
+env:
+  BOT_NAME:              ${{ vars.BOT_NAME || 'devops-bot' }}
+  BOT_EMAIL:             ${{ vars.BOT_EMAIL || 'devops-bot@akinus21.com' }}
+  MAIN_BRANCH:           ${{ vars.MAIN_BRANCH || 'main' }}
+  DEVOPS_BRANCH:         ${{ vars.DEVOPS_BRANCH || 'devops' }}
+  ISSUE_BRANCH_PREFIX:   ${{ vars.ISSUE_BRANCH_PREFIX || 'issue-' }}
+  BREW_TAP_ENABLED:      ${{ vars.BREW_TAP_ENABLED || 'false' }}
+  BREW_TAP_REPO:         ${{ vars.BREW_TAP_REPO || '' }}
+  BREW_TAP_BRANCH:       ${{ vars.BREW_TAP_BRANCH || 'main' }}
+  SOURCE_BIN_NAME:       ${{ vars.SOURCE_BIN_NAME || '' }}
+  OPENCODE_MODEL:        ${{ vars.OPENCODE_MODEL || '' }}
+  GITHUB_SERVER_URL:     ${{ github.server_url }}
+  GITHUB_REPOSITORY:     ${{ github.repository }}
+
+concurrency:
+  group: level1-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ============================================================
+  # Detect: figure out language, binary name, version source.
+  # Every downstream job depends on this so they can dispatch
+  # build/release commands through the same source of truth.
+  # ============================================================
+  detect:
+    runs-on: rust-ci
+    outputs:
+      language:    ${{ steps.det.outputs.language }}
+      bin_name:    ${{ steps.det.outputs.bin_name }}
+      version:     ${{ steps.det.outputs.version }}
+      version_file: ${{ steps.det.outputs.version_file }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect project metadata
+        id: det
+        run: |
+          set -euo pipefail
+          REPO_NAME=$(echo "$GITHUB_REPOSITORY" | cut -d/ -f2)
+
+          # Language + version source.
+          if   [ -f Cargo.toml ];   then LANG=rust
+          elif [ -f go.mod ];       then LANG=go
+          elif [ -f package.json ]; then LANG=node
+          elif [ -f pyproject.toml ] || [ -f setup.py ]; then LANG=python
+          else LANG=other
+          fi
+
+          # Binary name (used by release + bottles).
+          BIN="$SOURCE_BIN_NAME"
+          if [ -z "$BIN" ]; then
+            case "$LANG" in
+              rust)
+                BIN=$(grep -m1 '^name' Cargo.toml | sed 's/name *= *"\(.*\)"/\1/')
+                ;;
+              go)
+                BIN=$(grep -m1 '^module' go.mod | awk '{print $2}' | awk -F/ '{print $NF}')
+                [ -z "$BIN" ] && BIN="$REPO_NAME"
+                ;;
+              node)
+                BIN=$(python3 -c "import json; print(json.load(open('package.json')).get('name', '$REPO_NAME'))" 2>/dev/null || echo "$REPO_NAME")
+                ;;
+              python)
+                BIN=$(grep -m1 '^name' pyproject.toml 2>/dev/null | sed 's/name *= *"\(.*\)"/\1/')
+                [ -z "$BIN" ] && BIN="$REPO_NAME"
+                ;;
+              *)
+                BIN="$REPO_NAME"
+                ;;
+            esac
+          fi
+
+          # Current version + the file it lives in.
+          case "$LANG" in
+            rust)
+              VF="Cargo.toml"
+              V=$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+              ;;
+            node)
+              VF="package.json"
+              V=$(python3 -c "import json; print(json.load(open('package.json')).get('version','0.0.0'))" 2>/dev/null || echo "0.0.0")
+              ;;
+            python)
+              VF="pyproject.toml"
+              V=$(grep -m1 '^version' pyproject.toml 2>/dev/null | sed 's/version *= *"\(.*\)"/\1/')
+              [ -z "$V" ] && V="0.0.0"
+              ;;
+            go|*)
+              VF=""
+              V="0.0.0"
+              ;;
+          esac
+
+          {
+            echo "language=$LANG"
+            echo "bin_name=$BIN"
+            echo "version=$V"
+            echo "version_file=$VF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "detect: language=$LANG bin=$BIN version=$V version_file=$VF"
+
+  # ============================================================
+  # build-iterate: build + test, AI-fix on failure (3 attempts).
+  # Language-aware: dispatches cargo / go / npm / pytest based on
+  # the detect job's `language` output.
+  # ============================================================
+  build-iterate:
+    needs: detect
+    if: contains(github.event.head_commit.message, '[release-bot-skip]') == false
+    runs-on: rust-ci
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Preflight opencode on PATH
+        run: |
+          command -v opencode >/dev/null 2>&1 || {
+            echo "::error::opencode CLI not on PATH; install it on the runner and ensure the directory is on PATH."
+            exit 1
+          }
+
+      - name: Setup Rust
+        if: needs.detect.outputs.language == 'rust'
+        uses: https://github.com/dtolnay/rust-toolchain@stable
+
+      - name: Setup Go
+        if: needs.detect.outputs.language == 'go'
+        uses: https://github.com/actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Setup Node
+        if: needs.detect.outputs.language == 'node'
+        uses: https://github.com/actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python
+        if: needs.detect.outputs.language == 'python'
+        uses: https://github.com/actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build + Test (iteration 0)
+        id: build
+        run: |
+          set -o pipefail
+          case "${{ needs.detect.outputs.language }}" in
+            rust)
+              cargo build --release 2>&1 | tee /tmp/build.log
+              cargo test  --release 2>&1 | tee -a /tmp/build.log
+              ;;
+            go)
+              go build ./... 2>&1 | tee /tmp/build.log
+              go test  ./... 2>&1 | tee -a /tmp/build.log
+              ;;
+            node)
+              npm ci   2>&1 | tee /tmp/build.log
+              npm test 2>&1 | tee -a /tmp/build.log
+              ;;
+            python)
+              pip install -e . -q 2>&1 | tee /tmp/build.log
+              python -m pytest   2>&1 | tee -a /tmp/build.log
+              ;;
+            *)
+              echo "No build configured for language: ${{ needs.detect.outputs.language }}"
+              ;;
+          esac
+
+      - name: AI-fix loop (3 attempts)
+        if: failure()
+        run: |
+          set -uo pipefail
+          for iter in 1 2 3; do
+            echo "=== AI-fix iteration $iter ==="
+
+            python3 - > /tmp/aifix.md <<'PYEOF'
+          try:
+              with open('/tmp/build.log', 'rb') as f:
+                  log = f.read()[-12000:].decode('utf-8', errors='replace')
+          except Exception:
+              log = 'No build log available.'
+          print('# Task')
+          print()
+          print('The build below failed. Read the source code, find the root cause, and fix it.')
+          print('Do not output JSON. Edit files directly using your tools.')
+          print()
+          print('# Workflow')
+          print()
+          print('1. Read the relevant source files. The build log points at the first error - trace it back to the offending code.')
+          print('2. Make the minimal fix.')
+          print('3. After editing, run `cargo build --release` to confirm the fix. If you changed behavior, run `cargo test` too.')
+          print('4. Do not commit. The workflow commits and pushes the diff after opencode returns.')
+          print()
+          print('# Rules')
+          print()
+          print('- Make the minimal change that fixes the build.')
+          print('- Do NOT edit `AGENTS.md`, `.forgejo/workflows/*`, or `Formula/*`.')
+          print('- Do NOT modify `Cargo.toml` version.')
+          print()
+          print('# Build log (last 12KB)')
+          print()
+          print('```')
+          print(log.rstrip())
+          print('```')
+          PYEOF
+
+            MODEL_ARG=""
+            if [ -n "$OPENCODE_MODEL" ]; then
+              MODEL_ARG="--model $OPENCODE_MODEL"
+            fi
+            opencode run "$(cat /tmp/aifix.md)" \
+              --format default \
+              --pure \
+              --dangerously-skip-permissions \
+              $MODEL_ARG || true
+
+            git config user.name  "$BOT_NAME"
+            git config user.email "$BOT_EMAIL"
+            git add -A
+            if ! git diff --staged --quiet; then
+              git commit -m "fix(ci): AI build-fix iteration $iter"
+              git push
+            else
+              echo "opencode produced no changes this iteration."
+            fi
+
+            set +e
+            case "${{ needs.detect.outputs.language }}" in
+              rust)   cargo build --release 2>&1 | tee /tmp/build.log ;;
+              go)     go build ./... 2>&1 | tee /tmp/build.log ;;
+              node)   npm run build 2>&1 | tee /tmp/build.log ;;
+              python) pip install -e . -q 2>&1 | tee /tmp/build.log ;;
+              *)      exit 1 ;;
+            esac
+            BUILD_RC=$?
+            set -e
+            if [ "$BUILD_RC" = "0" ]; then
+              echo "build OK after iteration $iter"
+              exit 0
+            fi
+          done
+          echo "AI-fix gave up after 3 iterations."
+          exit 1
+
+  # ============================================================
+  # release: bump version, build artifact, cut Forgejo release,
+  # generate notes via opencode. Skips on [release-bot-skip] commits
+  # to prevent infinite recursion.
+  # ============================================================
+  release:
+    needs: [detect, build-iterate]
+    if: |
+      needs.build-iterate.result == 'success' &&
+      contains(github.event.head_commit.message, '[release-bot-skip]') == false
+    runs-on: rust-ci
+    outputs:
+      version:    ${{ steps.bump.outputs.version }}
+      asset_url:  ${{ steps.upload.outputs.asset_url }}
+      release_id: ${{ steps.upload.outputs.release_id }}
+      tag:        ${{ steps.upload.outputs.tag }}
+      bin_name:   ${{ needs.detect.outputs.bin_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Preflight opencode and github.token
+        run: |
+          command -v opencode >/dev/null 2>&1 || {
+            echo "::error::opencode CLI not on PATH; install it on the runner and ensure the directory is on PATH."
+            exit 1
+          }
+          [ -n "${{ github.token }}" ] || { echo "::error::github.token is empty"; exit 1; }
+
+      - name: Setup Rust
+        if: needs.detect.outputs.language == 'rust'
+        uses: https://github.com/dtolnay/rust-toolchain@stable
+
+      - name: Setup Go
+        if: needs.detect.outputs.language == 'go'
+        uses: https://github.com/actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Setup Node
+        if: needs.detect.outputs.language == 'node'
+        uses: https://github.com/actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python
+        if: needs.detect.outputs.language == 'python'
+        uses: https://github.com/actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Bump version
+        id: bump
+        run: |
+          set -euo pipefail
+          VF="${{ needs.detect.outputs.version_file }}"
+          CUR="${{ needs.detect.outputs.version }}"
+          LANG="${{ needs.detect.outputs.language }}"
+          if [ -z "$VF" ] || [ "$VF" = "" ]; then
+            echo "No version_file for language $LANG - leaving version at $CUR"
+            echo "version=$CUR" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          IFS=. read -r MA MI PA <<< "$CUR"
+          # Handle missing PA (e.g. "1.0" -> 1, 0, 0)
+          PA="${PA:-0}"
+          NEW="$MA.$MI.$((PA+1))"
+          case "$LANG" in
+            rust)
+              sed -i "0,/^version = \"$CUR\"/s//version = \"$NEW\"/" "$VF"
+              ;;
+            node)
+              python3 -c "
+          import json, sys
+          p='$VF'
+          d=json.load(open(p))
+          d['version']='$NEW'
+          json.dump(d, open(p,'w'), indent=2)
+          "
+              ;;
+            python)
+              sed -i "0,/^version *= *\"$CUR\"/s//version = \"$NEW\"/" "$VF"
+              ;;
+          esac
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+          echo "bumped $CUR -> $NEW in $VF"
+
+      - name: Commit the bump
+        id: commit_bump
+        run: |
+          set -euo pipefail
+          git config user.name  "$BOT_NAME"
+          git config user.email "$BOT_EMAIL"
+          git add -A
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: bump version to ${{ steps.bump.outputs.version }} [release-bot-skip]"
+            git push
+          fi
+          echo "new_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build release artifact
+        run: |
+          set -o pipefail
+          case "${{ needs.detect.outputs.language }}" in
+            rust)   cargo build --release ;;
+            go)     mkdir -p dist && go build -o dist/ ./... ;;
+            node)   npm ci && npm run build ;;
+            python) pip install build -q && python -m build ;;
+            *)      echo "no release build for ${{ needs.detect.outputs.language }}"; exit 1 ;;
+          esac
+
+      - name: Generate release notes via opencode
+        id: notes
+        run: |
+          set -euo pipefail
+          PREV=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          if [ -n "$PREV" ]; then
+            git log "${PREV}..HEAD~1" --oneline | head -30 > /tmp/commits.txt
+          else
+            git log --oneline | head -30 > /tmp/commits.txt
+          fi
+          cat /tmp/commits.txt
+
+          python3 - > /tmp/notes.md <<'PYEOF'
+          with open('/tmp/commits.txt') as f:
+              commits = f.read().strip() or '(no commits since last tag)'
+          print('# Task')
+          print()
+          print('Write concise Markdown release notes (3-5 bullet points) summarizing these commits.')
+          print('Group related commits. Use imperative mood. Skip CI / chore / release-bot-skip commits unless they did something user-visible.')
+          print('Write the result to /tmp/release_notes.txt using your `write` tool. Do not output Markdown to your response.')
+          print()
+          print('# Commits')
+          print()
+          print('```')
+          print(commits)
+          print('```')
+          PYEOF
+
+          MODEL_ARG=""
+          if [ -n "$OPENCODE_MODEL" ]; then
+            MODEL_ARG="--model $OPENCODE_MODEL"
+          fi
+          opencode run "$(cat /tmp/notes.md)" \
+            --format default \
+            --pure \
+            --dangerously-skip-permissions \
+            $MODEL_ARG || true
+
+          if [ ! -s /tmp/release_notes.txt ]; then
+            echo "opencode did not write /tmp/release_notes.txt - falling back to commit log"
+            cp /tmp/commits.txt /tmp/release_notes.txt
+          fi
+          echo "=== Release notes ==="
+          cat /tmp/release_notes.txt
+
+      - name: Create Forgejo release + upload artifact
+        id: upload
+        env:
+          # Use the forgejo-actions auto-token for the in-repo release
+          # API. TAP_TOKEN is the maintainer's cross-repo token
+          # intended for the homebrew tap and may lack write
+          # permission on this repo (which produced HTTP 403 with
+          # 'user should have a permission to write to a repo').
+          FORGEJO_TOKEN: ${{ github.token }}
+          VERSION:      ${{ steps.bump.outputs.version }}
+          BIN_NAME:     ${{ needs.detect.outputs.bin_name }}
+          LANGUAGE:     ${{ needs.detect.outputs.language }}
+        run: |
+          set -euo pipefail
+          TAG="v$VERSION"
+          BIN="$BIN_NAME"
+
+          if [ -z "${FORGEJO_TOKEN:-}" ]; then
+            echo "::error::FORGEJO_TOKEN (github.token) is empty; cannot create release"
+            echo "::error::ensure forgejo-actions auto-token is enabled on the runner"
+            exit 1
+          fi
+
+          # Locate the artifact per language.
+          case "$LANGUAGE" in
+            rust)
+              ASSET="target/release/$BIN"
+              ;;
+            go)
+              ASSET="dist/$BIN"
+              [ -f "$ASSET" ] || ASSET=$(find dist -maxdepth 1 -type f -executable | head -1)
+              ;;
+            node)
+              ASSET=$(find dist -maxdepth 2 -type f -executable 2>/dev/null | head -1)
+              [ -z "$ASSET" ] && ASSET="dist/index.js"
+              ;;
+            python)
+              ASSET=$(find dist -maxdepth 2 -type f \( -name "*.whl" -o -name "*.tar.gz" \) | head -1)
+              ;;
+            *)
+              ASSET=$(find . -maxdepth 3 -type f -executable -not -path "./.git/*" -not -path "./node_modules/*" | head -1)
+              ;;
+          esac
+
+          # Build payload with python so the JSON encoding is always
+          # valid even if release_notes contains quotes, newlines, or
+          # unicode. The previous heredoc-with-$(python) trick lost the
+          # python exit code (cat always succeeded) and produced empty
+          # bodies on transient heredoc issues.
+          NOTES=$(cat /tmp/release_notes.txt 2>/dev/null || echo "")
+          if [ -z "$NOTES" ]; then
+            echo "::warning::release_notes.txt is missing or empty; using fallback body"
+            NOTES="Automated release v$VERSION"
+          fi
+          export TARGET_SHA NOTES
+          TARGET_SHA=$(git rev-parse HEAD)
+          python3 - > /tmp/release_payload.json <<PYEOF
+          import json, os
+          print(json.dumps({
+              "tag_name": "v$VERSION",
+              "target_commitish": os.environ['TARGET_SHA'],
+              "name": "Release v$VERSION",
+              "body": os.environ['NOTES'],
+          }, ensure_ascii=False))
+          PYEOF
+
+          echo "=== release payload ==="
+          cat /tmp/release_payload.json
+          echo
+
+          # POST release. We capture the HTTP status + body separately
+          # so we can print a useful error message instead of dying
+          # silently with curl -f's exit-22 on 4xx/5xx.
+          HTTP=$(curl -s -o /tmp/release_resp.json -w "%{http_code}" \
+            -X POST "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases" \
+            -H "Authorization: token $FORGEJO_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/release_payload.json)
+          echo "release create HTTP $HTTP"
+          if [ "$HTTP" != "201" ]; then
+            echo "::error::release create returned HTTP $HTTP"
+            cat /tmp/release_resp.json
+            echo
+            exit 1
+          fi
+
+          RELEASE_ID=$(python3 -c "import json; print(json.load(open('/tmp/release_resp.json')).get('id',''))")
+          echo "release id: $RELEASE_ID"
+
+          ASSET_NAME=$(basename "${ASSET:-binary}")
+
+          if [ -n "$RELEASE_ID" ] && [ -n "$ASSET" ] && [ -f "$ASSET" ]; then
+            # Forgejo's release-assets API intermittently returns 500
+            # for fresh releases (commit not yet replicated). Retry with backoff.
+            HTTP=000
+            for attempt in 1 2 3 4 5; do
+              sleep $((attempt * 3))
+              HTTP=$(curl -s -o /tmp/upload_body.json -w "%{http_code}" \
+                -X POST \
+                "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$ASSET_NAME" \
+                -H "Authorization: token $FORGEJO_TOKEN" \
+                -H "Content-Type: application/octet-stream" \
+                --data-binary "@$ASSET")
+              echo "asset upload attempt $attempt: HTTP $HTTP"
+              if [ "$HTTP" = "201" ]; then break; fi
+              cat /tmp/upload_body.json 2>/dev/null
+              echo
+            done
+            if [ "$HTTP" != "201" ]; then
+              echo "::error::source asset upload failed for $ASSET_NAME after 5 attempts"
+              exit 1
+            fi
+            echo "asset uploaded: $ASSET_NAME"
+          else
+            echo "skipping asset upload: RELEASE_ID=$RELEASE_ID ASSET=$ASSET exists=$([ -f "${ASSET:-}" ] && echo yes || echo no)"
+          fi
+
+          # Brief pause to let Forgejo commit the release row before
+          # downstream jobs (bottles, formula-update) try to attach.
+          # Without this the asset upload returns 500.
+          sleep 2
+
+          {
+            echo "asset_url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$TAG/$ASSET_NAME"
+            echo "release_id=$RELEASE_ID"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
+
+  # ============================================================
+  # bottles: build + upload Linux bottles as release assets.
+  # Only produces bottles when the binary is a single executable
+  # (Rust, Go). For node/python, the artifact is multi-file so
+  # there's nothing to bottle.
+  # ============================================================
+  bottles:
+    needs: [detect, release]
+    if: |
+      needs.release.result == 'success' &&
+      contains('rust go', needs.detect.outputs.language)
+    runs-on: rust-ci
+    outputs:
+      x86_64_linux_sha: ${{ steps.bottle_x86.outputs.sha256 }}
+      arm64_linux_sha:  ${{ steps.bottle_arm64.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        if: needs.detect.outputs.language == 'rust'
+        uses: https://github.com/dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Setup Go
+        if: needs.detect.outputs.language == 'go'
+        uses: https://github.com/actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install cross toolchain (aarch64)
+        if: needs.detect.outputs.language == 'rust'
+        run: |
+          set -euo pipefail
+          # Drop sudo: the rust-ci job image is expected to run as root
+          # (rust-slim base) and already has apt-get available. If the
+          # image ever runs as a non-root user, this will fail loudly
+          # instead of silently producing broken cross binaries.
+          if command -v sudo >/dev/null 2>&1; then SUDO=sudo; else SUDO=""; fi
+          $SUDO apt-get update -q
+          $SUDO apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+
+      - name: Build x86_64 binary
+        env:
+          BIN_NAME: ${{ needs.detect.outputs.bin_name }}
+          VERSION:  ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          BIN="$BIN_NAME"
+          VERSION="$VERSION"
+          case "${{ needs.detect.outputs.language }}" in
+            rust)
+              cargo build --release --target x86_64-unknown-linux-gnu
+              SRC="target/x86_64-unknown-linux-gnu/release/$BIN"
+              ;;
+            go)
+              CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+                go build -ldflags="-s -w" -o /tmp/bottle_amd64_bin "$BIN"
+              SRC="/tmp/bottle_amd64_bin"
+              ;;
+          esac
+          BOT=/tmp/bottles/x86_64_linux
+          rm -rf "$BOT"
+          mkdir -p "$BOT/akclip/$VERSION/bin"
+          cp "$SRC" "$BOT/akclip/$VERSION/bin/akclip"
+
+      - name: Build aarch64 binary
+        env:
+          BIN_NAME: ${{ needs.detect.outputs.bin_name }}
+          VERSION:  ${{ needs.release.outputs.version }}
+          # Cargo's aarch64-unknown-linux-gnu target looks for a
+          # linker named aarch64-unknown-linux-gnu-gcc, but Ubuntu's
+          # gcc-aarch64-linux-gnu package provides aarch64-linux-gnu-gcc.
+          # Point Cargo at the right binary via the target-specific env
+          # var; CC_AR / CC is also useful for some crates' build scripts.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_CC: aarch64-linux-gnu-gcc
+        run: |
+          set -euo pipefail
+          BIN="$BIN_NAME"
+          VERSION="$VERSION"
+          case "${{ needs.detect.outputs.language }}" in
+            rust)
+              cargo build --release --target aarch64-unknown-linux-gnu
+              SRC="target/aarch64-unknown-linux-gnu/release/$BIN"
+              ;;
+            go)
+              CGO_ENABLED=0 CC=aarch64-linux-gnu-gcc \
+                go build -ldflags="-s -w" -o /tmp/bottle_arm64_bin "$BIN"
+              SRC="/tmp/bottle_arm64_bin"
+              ;;
+          esac
+          BOT=/tmp/bottles/arm64_linux
+          rm -rf "$BOT"
+          mkdir -p "$BOT/akclip/$VERSION/bin"
+          cp "$SRC" "$BOT/akclip/$VERSION/bin/akclip"
+
+      - name: Pack x86_64 bottle
+        id: bottle_x86
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          TAG:     ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="$VERSION"
+          BOT=/tmp/bottles/x86_64_linux
+          if [ -f Formula/akclip.rb ]; then
+            mkdir -p "$BOT/akclip/$VERSION/.brew"
+            cp Formula/akclip.rb "$BOT/akclip/$VERSION/.brew/akclip.rb"
+          fi
+
+          cd "$BOT"
+          tar czf "/tmp/akclip-${VERSION}.x86_64_linux.bottle.1.tar.gz" akclip
+          SHA=$(sha256sum "/tmp/akclip-${VERSION}.x86_64_linux.bottle.1.tar.gz" | awk '{print $1}')
+          echo "x86_64_linux sha256: $SHA"
+
+          # Stage for upload via the forgejo-release action.
+          mkdir -p /tmp/release_assets/x86_64_linux
+          cp "/tmp/akclip-${VERSION}.x86_64_linux.bottle.1.tar.gz" \
+             "/tmp/release_assets/x86_64_linux/akclip-${VERSION}.x86_64_linux.bottle.1.tar.gz"
+
+          {
+            echo "sha256=$SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Pack arm64 bottle
+        id: bottle_arm64
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          TAG:     ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="$VERSION"
+          BOT=/tmp/bottles/arm64_linux
+          if [ -f Formula/akclip.rb ]; then
+            mkdir -p "$BOT/akclip/$VERSION/.brew"
+            cp Formula/akclip.rb "$BOT/akclip/$VERSION/.brew/akclip.rb"
+          fi
+
+          cd "$BOT"
+          tar czf "/tmp/akclip-${VERSION}.arm64_linux.bottle.1.tar.gz" akclip
+          SHA=$(sha256sum "/tmp/akclip-${VERSION}.arm64_linux.bottle.1.tar.gz" | awk '{print $1}')
+          echo "arm64_linux sha256: $SHA"
+
+          mkdir -p /tmp/release_assets/arm64_linux
+          cp "/tmp/akclip-${VERSION}.arm64_linux.bottle.1.tar.gz" \
+             "/tmp/release_assets/arm64_linux/akclip-${VERSION}.arm64_linux.bottle.1.tar.gz"
+
+          {
+            echo "sha256=$SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload bottles
+        env:
+          RELEASE_ID: ${{ needs.release.outputs.release_id }}
+          TAG:       ${{ needs.release.outputs.tag }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          # In-repo release-asset upload: use the forgejo-actions
+          # auto-token. TAP_TOKEN is reserved for the cross-repo tap
+          # sync (see 'Sync formula to external tap repo' below) and
+          # may not have write permission on this repo.
+          FORGEJO_TOKEN:     ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for ARCH in x86_64_linux arm64_linux; do
+            BOTTLE="/tmp/release_assets/${ARCH}/$(ls /tmp/release_assets/${ARCH}/ | head -1)"
+            if [ ! -f "$BOTTLE" ]; then
+              echo "bottle missing for $ARCH"
+              continue
+            fi
+            BOTTLE_NAME=$(basename "$BOTTLE")
+            echo "uploading: $BOTTLE_NAME ($(stat -c%s "$BOTTLE") bytes)"
+            # Forgejo's release-assets API intermittently returns 500
+            # for fresh releases (commit not yet replicated to the read
+            # path used by the asset endpoint). Retry with backoff.
+            HTTP=000
+            for attempt in 1 2 3 4 5; do
+              sleep $((attempt * 3))
+              HTTP=$(curl -s -o /tmp/upload_body.json -w "%{http_code}" \
+                -X POST \
+                "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$BOTTLE_NAME" \
+                -H "Authorization: token $FORGEJO_TOKEN" \
+                -H "Content-Type: application/octet-stream" \
+                --data-binary "@$BOTTLE")
+              echo "  attempt $attempt: HTTP $HTTP"
+              if [ "$HTTP" = "201" ]; then break; fi
+              cat /tmp/upload_body.json 2>/dev/null
+              echo
+            done
+            if [ "$HTTP" != "201" ]; then
+              echo "::error::bottle upload failed for $BOTTLE_NAME after 5 attempts"
+              exit 1
+            fi
+          done
+
+  # ============================================================
+  # formula-update: render Formula/<bin>.rb with the new bottle
+  # block and push to both this repo and the external tap.
+  # Skipped entirely if BREW_TAP_ENABLED != 'true'.
+  # ============================================================
+  formula-update:
+    needs: [detect, release, bottles]
+    if: |
+      needs.release.result == 'success' &&
+      needs.bottles.result == 'success' &&
+      vars.BREW_TAP_ENABLED == 'true'
+    runs-on: rust-ci
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Sync with remote main before staging anything. The release
+      # job's bump commit may have landed after our checkout, which
+      # would make the formula-update push non-fast-forward.
+      - name: Sync with remote main
+        run: |
+          git fetch origin main
+          git rebase origin/main
+
+      - name: Render formula
+        id: render
+        env:
+          ASSET_URL:         ${{ needs.release.outputs.asset_url }}
+          VERSION:           ${{ needs.release.outputs.version }}
+          BIN_NAME:          ${{ needs.detect.outputs.bin_name }}
+          X86_SHA:           ${{ needs.bottles.outputs.x86_64_linux_sha }}
+          ARM_SHA:           ${{ needs.bottles.outputs.arm64_linux_sha }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          curl -sL "$ASSET_URL" -o /tmp/release_asset
+          SRC_SHA=$(sha256sum /tmp/release_asset | awk '{print $1}')
+
+          REPO_NAME=$(echo "$GITHUB_REPOSITORY" | cut -d/ -f2)
+          BIN="$BIN_NAME"
+          CLASS_NAME=$(python3 -c "
+          name = '$BIN'
+          print(''.join(p.capitalize() for p in name.replace('-','_').split('_')))
+          ")
+          DESC=$(python3 -c "
+          try:
+              d = json.load(open('package.json'))
+              print(d.get('description', 'Command-line utility'))
+          except Exception:
+              print('Command-line utility')
+          ")
+
+          mkdir -p Formula
+
+          cat > "Formula/${REPO_NAME}.rb" << FORMULA
+          class ${CLASS_NAME} < Formula
+            desc "${DESC}"
+            homepage "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+            url "$ASSET_URL"
+            version "$VERSION"
+            sha256 "$SRC_SHA"
+            license "MIT"
+
+            bottle do
+              rebuild 1
+              root_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/v$VERSION"
+              sha256 cellar: :any_skip_relocation, x86_64_linux: "$X86_SHA"
+              sha256 cellar: :any_skip_relocation, arm64_linux:  "$ARM_SHA"
+            end
+
+            def install
+              bin.install "${BIN}"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/${BIN} --version")
+            end
+          end
+          FORMULA
+
+          cat "Formula/${REPO_NAME}.rb"
+
+      - name: Commit in-repo formula
+        env:
+          VERSION:    ${{ needs.release.outputs.version }}
+          BOT_NAME:   ${{ vars.BOT_NAME || 'devops-bot' }}
+          BOT_EMAIL:  ${{ vars.BOT_EMAIL || 'devops-bot@akinus21.com' }}
+        run: |
+          set -euo pipefail
+          git config user.name  "$BOT_NAME"
+          git config user.email "$BOT_EMAIL"
+          git add Formula/
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: update homebrew formula v${VERSION} with bottles [release-bot-skip]"
+            # If the release bump landed between our rebase and now,
+            # pull + rebase then retry once before giving up.
+            if ! git push; then
+              git fetch origin main
+              git rebase origin/main
+              git push
+            fi
+          else
+            echo "no in-repo formula change"
+          fi
+
+      - name: Sync formula to external tap repo
+        env:
+          # Use TAP_TOKEN (the maintainer's cross-repo token) instead
+          # of the forgejo-actions pseudo-user's auto-token, which
+          # can't push to external repos.
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+          TAP_REPO: ${{ env.BREW_TAP_REPO }}
+          TAP_BRANCH: ${{ env.BREW_TAP_BRANCH }}
+          VERSION: ${{ needs.release.outputs.version }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -uo pipefail  # NOT -e; we want to capture errors, not abort
+          # Skip when BREW_TAP_REPO is unset/empty.
+          if [ -z "${TAP_REPO:-}" ]; then
+            echo "BREW_TAP_REPO not set; skipping tap sync"
+            exit 0
+          fi
+
+          # Derive the tap URL host from github.server_url so this
+          # works on any Forgejo/Gitea host, not just forge.akinus21.com.
+          # The tap repo lives on the SAME host as this repo.
+          TAP_HOST=$(echo "$GITHUB_SERVER_URL" | sed -E 's|^https?://||; s|/$||; s|:.*$||')
+          TAP_URL="https://x-access-token:${TAP_TOKEN}@${TAP_HOST}/${TAP_REPO}.git"
+          echo "tap clone URL host: ${TAP_HOST}"
+
+          TAP_DIR="/tmp/tap_work"
+          rm -rf "$TAP_DIR"
+          if ! git clone -b "$TAP_BRANCH" "$TAP_URL" "$TAP_DIR"; then
+            echo "::warning::Failed to clone tap repo; tap sync skipped"
+            exit 0
+          fi
+
+          cp "Formula/$(echo $GITHUB_REPOSITORY | cut -d/ -f2).rb" "$TAP_DIR/Formula/"
+
+          cd "$TAP_DIR"
+          git config user.name  "$BOT_NAME"
+          git config user.email "$BOT_EMAIL"
+          git add "Formula/"
+          if ! git diff --staged --quiet; then
+            if ! git commit -m "chore: update formula to v${VERSION} (with bottles)"; then
+              echo "::warning::commit failed; tap sync skipped"
+              exit 0
+            fi
+            if git push origin "$TAP_BRANCH"; then
+              echo "synced formula to $TAP_REPO"
+            else
+              echo "::warning::Push to tap rejected (token may lack write access)"
+              echo "::warning::Tap must be synced manually"
+            fi
+          else
+            echo "no tap formula change"
+          fi
+
+  # ============================================================
+  # tidy: cleanup orphaned issue branches, toggle stale labels
+  # ============================================================
+  tidy:
+    needs: [release, bottles]
+    if: needs.release.result == 'success' && needs.bottles.result == 'success'
+    runs-on: rust-ci
+    steps:
+      - name: Delete orphaned issue branches + toggle stale labels
+        env:
+          # tidy talks to the in-repo API (delete branches, toggle
+          # labels); use the forgejo-actions auto-token.
+          FORGEJO_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_BRANCH_PREFIX: ${{ vars.ISSUE_BRANCH_PREFIX || 'issue-' }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+        run: |
+          set -euo pipefail
+          # Don't silently fall back to a placeholder URL; a wrong
+          # server would otherwise cause API calls to fail with
+          # connection errors while the job still reports green.
+          if [ -z "${GITHUB_SERVER_URL:-}" ] || [ "$GITHUB_SERVER_URL" = "http://forgejo:3000" ]; then
+            echo "::error::GITHUB_SERVER_URL is unset or defaulted to placeholder: '$GITHUB_SERVER_URL'"
+            echo "::error::tidy cannot talk to the Forgejo API. Check runner / Forgejo Actions configuration."
+            exit 1
+          fi
+          SERVER="$GITHUB_SERVER_URL"
+
+          python3 - << 'PYEOF'
+          import os, json, urllib.request, urllib.error
+          from datetime import datetime, timezone, timedelta
+
+          TOKEN      = os.environ['FORGEJO_TOKEN']
+          REPO       = os.environ['REPO']
+          SERVER     = os.environ['GITHUB_SERVER_URL']
+          PREFIX     = os.environ.get('ISSUE_BRANCH_PREFIX', 'issue-')
+          STALE_DAYS = 30
+          TRACK      = {'bug', 'enhancement'}
+          cutoff     = datetime.now(timezone.utc) - timedelta(days=STALE_DAYS)
+
+          def api(method, path, body=None):
+              data = json.dumps(body).encode() if body else None
+              req = urllib.request.Request(
+                  f"{SERVER}/api/v1/{path}", data=data, method=method,
+                  headers={"Authorization": f"token {TOKEN}",
+                           "Content-Type": "application/json"})
+              try:
+                  with urllib.request.urlopen(req) as r:
+                      return json.loads(r.read() or b'{}')
+              except urllib.error.HTTPError as e:
+                  print(f"HTTP {e.code}: {method} {path}", file=__import__('sys').stderr)
+                  return {}
+
+          branches = [b['name'] for b in api("GET", f"repos/{REPO}/branches?limit=100") or []
+                      if b['name'].startswith(PREFIX)]
+
+          for branch in branches:
+              issue_n = branch[len(PREFIX):]
+              issue = api("GET", f"repos/{REPO}/issues/{issue_n}")
+              open_prs = api("GET", f"repos/{REPO}/pulls?state=open&head={branch}") or []
+              issue_closed = bool(issue) and issue.get('state') == 'closed'
+
+              if issue_closed and not open_prs:
+                  api("DELETE", f"repos/{REPO}/branches/{branch}")
+                  print(f"deleted orphaned branch: {branch}")
+              elif open_prs:
+                  print(f"skip {branch}: has open PR")
+              else:
+                  print(f"skip {branch}: issue #{issue_n} still open")
+
+          stale_id = None
+          issues = api("GET", f"repos/{REPO}/issues?state=open&type=issues&limit=100") or []
+
+          for issue in issues:
+              labels  = {l['name']: l['id'] for l in issue.get('labels', [])}
+              updated = datetime.fromisoformat(issue['updated_at'].replace('Z', '+00:00'))
+              number  = issue['number']
+
+              if not (set(labels) & TRACK):
+                  continue
+
+              if updated < cutoff and 'stale' not in labels:
+                  if stale_id is None:
+                      for l in (api("GET", f"repos/{REPO}/labels") or []):
+                          if l['name'] == 'stale':
+                              stale_id = l['id']; break
+                      if stale_id is None:
+                          created = api("POST", f"repos/{REPO}/labels",
+                                        {"name": "stale", "color": "#cccccc"})
+                          stale_id = (created or {}).get('id')
+                  if stale_id:
+                      api("POST", f"repos/{REPO}/issues/{number}/labels", {"labels": [stale_id]})
+                      print(f"marked #{number} stale")
+              elif updated >= cutoff and 'stale' in labels:
+                  api("DELETE", f"repos/{REPO}/issues/{number}/labels/{labels['stale']}")
+                  print(f"removed stale from #{number}")
+          PYEOF

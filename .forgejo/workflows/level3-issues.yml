@@ -1,0 +1,690 @@
+name: Level 3 — Issues
+
+on:
+  issues:
+    types: [opened, edited, labeled, unlabeled]
+  push:
+    branches: [issue-*]  # edit if your issue branches use a different prefix
+
+# See level1-main.yml for the full list of supported vars.
+# This workflow uses:
+#   ISSUE_BRANCH_PREFIX - prefix for AI-generated branches (default: issue-)
+#   DEVOPS_BRANCH       - base branch the issue branch forks from (default: devops)
+#   BOT_NAME / BOT_EMAIL - identity for AI-authored commits
+#   OPENCODE_MODEL      - optional model override for `opencode run --model`.
+#                        If unset, opencode uses its configured default.
+#
+# The AI integration uses the local `opencode` CLI. opencode has full
+# file-tool access: it reads the codebase itself, decides what to
+# change, and edits files directly. We never ask the model to
+# output a JSON `changes` list - it just edits the working tree,
+# and the workflow commits the diff afterwards.
+#
+# Triage is the one exception: opencode writes a JSON decision to
+# /tmp/triage.json which the workflow then reads.
+#
+env:
+  BOT_NAME:              ${{ vars.BOT_NAME || 'devops-bot' }}
+  BOT_EMAIL:             ${{ vars.BOT_EMAIL || 'devops-bot@akinus21.com' }}
+  DEVOPS_BRANCH:         ${{ vars.DEVOPS_BRANCH || 'devops' }}
+  ISSUE_BRANCH_PREFIX:   ${{ vars.ISSUE_BRANCH_PREFIX || 'issue-' }}
+  GITHUB_SERVER_URL:     ${{ github.server_url }}
+  GITHUB_REPOSITORY:     ${{ github.repository }}
+  OPENCODE_MODEL:        ${{ vars.OPENCODE_MODEL || '' }}
+
+concurrency:
+  # Group per-issue so label/comment/edit activity for the same issue
+  # doesn't run in parallel. cancel-in-progress: true means a new
+  # issue event cancels any prior queued or running run for that
+  # issue, preventing the concurrency group from getting permanently
+  # stuck when one run fails to release the lock (a Forgejo Actions
+  # quirk that previously left "blocked" runs queued indefinitely).
+  group: >-
+    level3-${{ github.event_name == 'push' &&
+    github.ref ||
+    format('issue-{0}', github.event.issue.number) }}
+  cancel-in-progress: true
+
+jobs:
+  label_check:
+    if: github.event_name == 'issues'
+    runs-on: rust-ci
+    outputs:
+      relevant: ${{ steps.check.outputs.relevant }}
+    steps:
+      - name: Preflight opencode and github.token
+        run: |
+          set -euo pipefail
+          command -v opencode >/dev/null 2>&1 || {
+            echo "::error::opencode CLI not on PATH; install it on the runner (e.g. /var/home/<user>/.opencode/bin/opencode) and ensure the directory is on PATH for the runner user."
+            exit 1
+          }
+          [ -n "${GITHUB_SERVER_URL:-}" ] || { echo "::error::GITHUB_SERVER_URL is empty"; exit 1; }
+          [ -n "${GITHUB_REPOSITORY:-}" ] || { echo "::error::GITHUB_REPOSITORY is empty"; exit 1; }
+          [ -n "${{ github.token }}" ] || { echo "::error::github.token is empty; ensure forgejo-actions auto-token is enabled on the runner"; exit 1; }
+
+      - name: Check labels (only auto-fix bug/enhancement)
+        id: check
+        env:
+          FORGEJO_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ISSUE_NUMBER="${{ github.event.issue.number }}"
+          ISSUE_JSON=$(curl -s \
+            "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER" \
+            -H "Authorization: token $FORGEJO_TOKEN")
+          LABELS=$(echo "$ISSUE_JSON" | python3 -c "
+          import sys, json
+          try:
+              d = json.load(sys.stdin)
+              print(','.join(l['name'] for l in d.get('labels', [])))
+          except Exception:
+              print('')
+          ")
+          echo "issue #$ISSUE_NUMBER labels: ${LABELS:-<none>}"
+          case ",$LABELS," in
+            *,bug,*|*,enhancement,*)
+              echo "relevant=true" >> "$GITHUB_OUTPUT"
+              echo "issue has bug/enhancement label - proceeding"
+              ;;
+            *)
+              echo "relevant=false" >> "$GITHUB_OUTPUT"
+              echo "issue lacks bug/enhancement label - skipping triage"
+              ;;
+          esac
+
+  triage:
+    needs: label_check
+    if: github.event_name == 'issues' && needs.label_check.outputs.relevant == 'true'
+    runs-on: rust-ci
+    outputs:
+      action: ${{ steps.parse.outputs.action }}
+      branch_name: ${{ steps.parse.outputs.branch_name }}
+      reason: ${{ steps.parse.outputs.reason }}
+    steps:
+      - name: Preflight opencode and github.token
+        run: |
+          set -euo pipefail
+          command -v opencode >/dev/null 2>&1 || {
+            echo "::error::opencode CLI not on PATH; install it on the runner and ensure the directory is on PATH."
+            exit 1
+          }
+          [ -n "${{ github.token }}" ] || { echo "::error::github.token is empty"; exit 1; }
+
+      # Shallow checkout so opencode can read the source code and
+      # make an informed triage decision. Without this the workspace
+      # is empty and opencode conservatively chooses action=skip
+      # (which is what happened on the first end-to-end test).
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ github.token }}
+
+      - name: Fetch issue comments
+        env:
+          FORGEJO_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # curl -s exits 0 even on HTTP errors, so we add -f and a
+          # JSON-validity check; if either fails, fall back to [] so
+          # the prompt builder doesn't choke.
+          if ! curl -fsS \
+              "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/issues/${{ github.event.issue.number }}/comments" \
+              -H "Authorization: token $FORGEJO_TOKEN" \
+              -o /tmp/comments.json \
+            || ! python3 -c "import json,sys; json.load(open('/tmp/comments.json'))" >/dev/null 2>&1; then
+            echo '[]' > /tmp/comments.json
+            echo "WARN: comments fetch failed or returned non-JSON; using empty list"
+          fi
+
+      - name: Build triage prompt
+        env:
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          python3 - > /tmp/triage.md <<'PYEOF'
+          import os, json
+          title = os.environ.get('ISSUE_TITLE', '')
+          body = os.environ.get('ISSUE_BODY', '')
+          number = os.environ.get('ISSUE_NUMBER', '0')
+          prefix = os.environ.get('ISSUE_BRANCH_PREFIX', 'issue-')
+          with open('/tmp/comments.json') as f:
+              data = json.load(f)
+          comments_md = '(no comments)'
+          if isinstance(data, list) and data:
+              out = []
+              for i, c in enumerate(data, 1):
+                  u = (c.get('user') or {}).get('login', 'unknown')
+                  b = (c.get('body') or '').strip()
+                  if b:
+                      out.append('--- comment ' + str(i) + ' by ' + u + ' ---\n' + b)
+              if out:
+                  comments_md = '\n\n'.join(out)
+          print('# Task')
+          print()
+          print('Triage this GitHub issue and decide whether an AI can auto-fix it.')
+          print('Read the codebase as needed to make an informed decision.')
+          print()
+          print('# Issue #' + number)
+          print()
+          print('**Title:** ' + title)
+          print()
+          print('**Body:**')
+          print()
+          print(body or '(empty)')
+          print()
+          print('# Comments')
+          print()
+          print(comments_md)
+          print()
+          print('# Output')
+          print()
+          print('Write a JSON file to /tmp/triage.json with exactly these keys:')
+          print('- `action`: one of "fix", "comment", or "skip"')
+          print('- `branch_name`: if action is "fix", use `' + prefix + number + '`; otherwise empty string')
+          print('- `reason`: one short sentence explaining the decision')
+          print()
+          print('Decision rules:')
+          print('- "fix" if the issue describes a concrete bug or enhancement in this repository that an automated patch can address.')
+          print('- "comment" if it is a question, usage help, or needs human clarification.')
+          print('- "skip" if it is spam, off-topic for this repo, or reports a problem in another system that this repo cannot fix.')
+          print()
+          print('When unsure between "fix" and "comment", prefer "fix" and let the apply stage reject it if you cannot produce a useful change.')
+          print()
+          print('Write the file using your `write` tool. Do not output the JSON to your response.')
+          PYEOF
+
+      - name: Run opencode triage
+        run: |
+          set -euo pipefail
+          MODEL_ARG=""
+          if [ -n "$OPENCODE_MODEL" ]; then
+            MODEL_ARG="--model $OPENCODE_MODEL"
+          fi
+          opencode run "$(cat /tmp/triage.md)" \
+            --format default \
+            --pure \
+            --dangerously-skip-permissions \
+            $MODEL_ARG
+          if [ ! -s /tmp/triage.json ]; then
+            echo "opencode did not write /tmp/triage.json - defaulting to skip"
+            echo '{"action":"skip","branch_name":"","reason":"opencode produced no decision file"}' > /tmp/triage.json
+          fi
+
+      - name: Parse triage result
+        id: parse
+        run: |
+          set -euo pipefail
+          ISSUE_NUMBER="${{ github.event.issue.number }}"
+          PREFIX="$ISSUE_BRANCH_PREFIX"
+          python3 - > /tmp/triage_parsed.json <<'PYEOF'
+          import json, os, re
+          prefix = os.environ.get('ISSUE_BRANCH_PREFIX', 'issue-')
+          number = os.environ.get('ISSUE_NUMBER', '0')
+          try:
+              with open('/tmp/triage.json') as f:
+                  data = json.load(f)
+          except Exception as e:
+              data = {}
+          action = data.get('action', 'skip')
+          if action not in ('fix', 'comment', 'skip'):
+              action = 'skip'
+          branch = data.get('branch_name', '') or ''
+          if not re.match(r'^' + re.escape(prefix) + r'[0-9]+$', branch):
+              branch = prefix + str(number)
+          reason = data.get('reason', '') or ''
+          out = {'action': action, 'branch_name': branch, 'reason': reason}
+          with open('/tmp/triage_parsed.json', 'w') as f:
+              json.dump(out, f)
+          print(json.dumps(out))
+          PYEOF
+          ACTION=$(jq -r .action /tmp/triage_parsed.json)
+          BRANCH=$(jq -r .branch_name /tmp/triage_parsed.json)
+          REASON=$(jq -r .reason /tmp/triage_parsed.json)
+          {
+            echo "action=$ACTION"
+            echo "branch_name=$BRANCH"
+            echo "reason=$REASON"
+          } >> "$GITHUB_OUTPUT"
+          echo "triage: action=$ACTION branch=$BRANCH reason=$REASON"
+
+  comment:
+    needs: triage
+    if: github.event_name == 'issues' && needs.triage.outputs.action == 'comment'
+    runs-on: rust-ci
+    steps:
+      - name: Acknowledge
+        env:
+          FORGEJO_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          jq -n '{body:"Thanks for reporting - a maintainer will investigate."}' > /tmp/c.json
+          curl -s -X POST \
+            "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/issues/${{ github.event.issue.number }}/comments" \
+            -H "Authorization: token $FORGEJO_TOKEN" \
+            -H "Content-Type: application/json" -d @/tmp/c.json
+
+  skip-notify:
+    needs: triage
+    if: github.event_name == 'issues' && needs.triage.outputs.action == 'skip'
+    runs-on: rust-ci
+    steps:
+      - name: Post skip reason
+        env:
+          FORGEJO_TOKEN: ${{ github.token }}
+          REASON: ${{ needs.triage.outputs.reason }}
+        run: |
+          set -euo pipefail
+
+          # Write the Python helper to a file so bash doesn't try to
+          # interpret backticks in the body text as command substitution.
+          cat > /tmp/build_skip_body.py << 'PYEOF'
+          import os
+          reason = os.environ.get('REASON', '').strip()
+          base = 'Auto-triage: skipping this issue.'
+          hint  = 'If this is wrong, add the `bug` or `enhancement` label and re-comment, or open a PR manually.'
+          if reason:
+              body = f"{base}\n\n{reason}\n\n{hint}"
+          else:
+              body = f"{base}\n\n{hint}"
+          print(body)
+          PYEOF
+
+          BODY=$(REASON="$REASON" python3 /tmp/build_skip_body.py)
+          jq -n --arg body "$BODY" '{body:$body}' > /tmp/c.json
+          curl -s -X POST \
+            "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/issues/${{ github.event.issue.number }}/comments" \
+            -H "Authorization: token $FORGEJO_TOKEN" \
+            -H "Content-Type: application/json" -d @/tmp/c.json
+
+  create-fix-branch:
+    needs: triage
+    if: github.event_name == 'issues' && needs.triage.outputs.action == 'fix'
+    runs-on: rust-ci
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Preflight opencode and github.token
+        run: |
+          set -euo pipefail
+          command -v opencode >/dev/null 2>&1 || {
+            echo "::error::opencode CLI not on PATH; install it on the runner and ensure the directory is on PATH."
+            exit 1
+          }
+          [ -n "${{ github.token }}" ] || { echo "::error::github.token is empty"; exit 1; }
+
+      - name: Create branch off devops
+        run: |
+          set -euo pipefail
+          BRANCH="${{ needs.triage.outputs.branch_name }}"
+          git fetch origin "$DEVOPS_BRANCH" 2>/dev/null || true
+          git checkout -b "$BRANCH" "origin/$DEVOPS_BRANCH" 2>/dev/null \
+            || git checkout -b "$BRANCH"
+
+      - name: Build fix prompt
+        env:
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          FORGEJO_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # curl -s exits 0 even on HTTP errors; add -fS + JSON check
+          # and fall back to [] if anything goes wrong.
+          if ! curl -fsS \
+              "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments" \
+              -H "Authorization: token $FORGEJO_TOKEN" \
+              -o /tmp/comments.json \
+            || ! python3 -c "import json,sys; json.load(open('/tmp/comments.json'))" >/dev/null 2>&1; then
+            echo '[]' > /tmp/comments.json
+            echo "WARN: comments fetch failed or returned non-JSON; using empty list"
+          fi
+          python3 - > /tmp/fix.md <<'PYEOF'
+          import os, json
+          title = os.environ.get('ISSUE_TITLE', '')
+          body = os.environ.get('ISSUE_BODY', '')
+          number = os.environ.get('ISSUE_NUMBER', '0')
+          with open('/tmp/comments.json') as f:
+              data = json.load(f)
+          comments_md = '(no comments)'
+          if isinstance(data, list) and data:
+              out = []
+              for i, c in enumerate(data, 1):
+                  u = (c.get('user') or {}).get('login', 'unknown')
+                  b = (c.get('body') or '').strip()
+                  if b:
+                      out.append('--- comment ' + str(i) + ' by ' + u + ' ---\n' + b)
+              if out:
+                  comments_md = '\n\n'.join(out)
+          print('# Task')
+          print()
+          print('You are fixing a GitHub issue in this Rust project.')
+          print('Read the codebase as needed using your tools, then make the minimal, correct code change.')
+          print('Do not write a JSON response. Edit files directly using your `edit` / `write` tools.')
+          print()
+          print('# Issue #' + number)
+          print()
+          print('**Title:** ' + title)
+          print()
+          print('**Body:**')
+          print()
+          print(body or '(empty)')
+          print()
+          print('# Comments')
+          print()
+          print(comments_md)
+          print()
+          print('# Workflow')
+          print()
+          print('1. Read the relevant source files (start with `Cargo.toml`, `src/main.rs`, and any `src/clipboard/*.rs` files).')
+          print('2. Make the minimal change that addresses the issue. Edit files in place.')
+          print('3. After editing, run `cargo build --release` to confirm it compiles. If you changed behavior, also run `cargo test`.')
+          print('4. Fix any errors that come up. Do not commit - the workflow will commit your changes.')
+          print()
+          print('# Rules')
+          print()
+          print('- Make the minimal change that resolves the issue. Do not refactor unrelated code.')
+          print('- Match the existing code style (use tabs as in `cargo fmt` would produce; check existing files).')
+          print('- If the issue is ambiguous or cannot be addressed by code changes, leave a TODO comment in a sensible place and explain in a final assistant message - the workflow will still commit.')
+          print('- Do NOT edit `AGENTS.md`, `.forgejo/workflows/*`, or `Formula/*` - those are managed by the release pipeline.')
+          print('- Do NOT modify `Cargo.toml` version (the release pipeline owns that).')
+          PYEOF
+
+      - name: Run opencode fix
+        run: |
+          set -euo pipefail
+          MODEL_ARG=""
+          if [ -n "$OPENCODE_MODEL" ]; then
+            MODEL_ARG="--model $OPENCODE_MODEL"
+          fi
+          opencode run "$(cat /tmp/fix.md)" \
+            --format default \
+            --pure \
+            --dangerously-skip-permissions \
+            $MODEL_ARG
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          BRANCH="${{ needs.triage.outputs.branch_name }}"
+          git config user.name  "$BOT_NAME"
+          git config user.email "$BOT_EMAIL"
+          git add -A
+          if ! git diff --staged --quiet; then
+            # Include 'Fixes #N' so the level2 close-merged-issue job
+            # can find this issue when the devops->main PR merges.
+            # The create-fix-branch job below also closes the issue
+            # directly via the API (belt-and-suspenders).
+            git commit -m "fix(ai): Fixes #${{ github.event.issue.number }} [release-bot-skip]"
+            git push origin "$BRANCH"
+          else
+            echo "AI produced no changes; nothing to commit."
+          fi
+
+      - name: Close issue with summary
+        if: success()
+        env:
+          FORGEJO_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ISSUE_NUM="${{ github.event.issue.number }}"
+          echo "Closing issue #$ISSUE_NUM (a PR has been opened from the AI fix branch)"
+          jq -n --arg body "Auto-closed: an AI-generated fix has been opened as a PR against the devops branch. Merge it to land the change." \
+            '{body:$body}' > /tmp/c.json
+          curl -s -X POST \
+            "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUM/comments" \
+            -H "Authorization: token $FORGEJO_TOKEN" \
+            -H "Content-Type: application/json" -d @/tmp/c.json > /dev/null
+          curl -s -X PATCH \
+            "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUM" \
+            -H "Authorization: token $FORGEJO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"state":"closed"}' > /dev/null
+          echo "issue #$ISSUE_NUM closed"
+
+      # Open issue-N -> devops PR directly from this run. We don't
+      # rely on the forgejo-actions user's push re-triggering the
+      # workflow via 'push' (Forgejo Actions blocks that to prevent
+      # recursion), so the PR creation has to happen here. The
+      # separate build-iterate step (which runs on push events) is
+      # left in place for non-AI pushes (e.g., a human iterating on
+      # the issue branch).
+      - name: Open PR issue-N -> devops
+        if: success()
+        env:
+          FORGEJO_TOKEN: ${{ github.token }}
+          BRANCH: ${{ needs.triage.outputs.branch_name }}
+          BASE:   ${{ env.DEVOPS_BRANCH }}
+          ISSUE:  ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          EXISTING=$(curl -s \
+            "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/pulls?state=open&head=$BRANCH&base=$BASE" \
+            -H "Authorization: token $FORGEJO_TOKEN")
+          COUNT=$(echo "$EXISTING" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
+          if [ "$COUNT" -gt 0 ]; then
+            echo "PR already open for $BRANCH -> $BASE - skipping."
+            exit 0
+          fi
+          python3 - > /tmp/pr_body.json << 'PYEOF'
+          import json, os
+          print(json.dumps({
+              'title': os.environ['BRANCH'] + ' -> ' + os.environ['BASE'],
+              'head':  os.environ['BRANCH'],
+              'base':  os.environ['BASE'],
+              'body':  'Auto-implements #' + os.environ['ISSUE'] + '.\n\nOpen this PR to merge the AI-generated fix.',
+          }))
+          PYEOF
+          RESP=$(curl -s -X POST "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/pulls" \
+            -H "Authorization: token $FORGEJO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/pr_body.json)
+          echo "$RESP"
+          if echo "$RESP" | grep -q '"id"'; then
+            echo "PR opened for $BRANCH -> $BASE"
+          else
+            echo "::warning::PR creation failed: $RESP"
+            exit 1
+          fi
+
+  build-iterate:
+    if: github.event_name == 'push'
+    runs-on: rust-ci
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Preflight opencode and github.token
+        run: |
+          set -euo pipefail
+          command -v opencode >/dev/null 2>&1 || {
+            echo "::error::opencode CLI not on PATH; install it on the runner and ensure the directory is on PATH."
+            exit 1
+          }
+          [ -n "${{ github.token }}" ] || { echo "::error::github.token is empty"; exit 1; }
+
+      - name: Setup Rust
+        if: hashFiles('Cargo.toml') != ''
+        uses: https://github.com/dtolnay/rust-toolchain@stable
+
+      - name: Setup Go
+        if: hashFiles('go.mod') != ''
+        uses: https://github.com/actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Setup Node
+        if: hashFiles('package.json') != ''
+        uses: https://github.com/actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python
+        if: hashFiles('pyproject.toml') != '' || hashFiles('setup.py') != ''
+        uses: https://github.com/actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Detect language
+        id: detect
+        run: |
+          if   [ -f Cargo.toml ];                         then echo "language=rust"   >> $GITHUB_OUTPUT
+          elif [ -f go.mod ];                             then echo "language=go"     >> $GITHUB_OUTPUT
+          elif [ -f package.json ];                       then echo "language=node"   >> $GITHUB_OUTPUT
+          elif [ -f pyproject.toml ] || [ -f setup.py ]; then echo "language=python" >> $GITHUB_OUTPUT
+          else                                                 echo "language=other"  >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build + Test (iteration 0)
+        id: build
+        run: |
+          set -o pipefail
+          case "${{ steps.detect.outputs.language }}" in
+            rust)
+              cargo build --release 2>&1 | tee /tmp/build.log
+              cargo test  --release 2>&1 | tee -a /tmp/build.log
+              ;;
+            go)
+              go build ./... 2>&1 | tee /tmp/build.log
+              go test  ./... 2>&1 | tee -a /tmp/build.log
+              ;;
+            node)
+              npm ci   2>&1 | tee /tmp/build.log
+              npm test 2>&1 | tee -a /tmp/build.log
+              ;;
+            python)
+              pip install -e . -q 2>&1 | tee /tmp/build.log
+              python -m pytest   2>&1 | tee -a /tmp/build.log
+              ;;
+            *)
+              echo "No build configured for language: ${{ steps.detect.outputs.language }}"
+              ;;
+          esac
+
+      - name: AI-fix loop (3 attempts)
+        if: failure()
+        run: |
+          set -uo pipefail
+          for iter in 1 2 3; do
+            echo "=== AI-fix iteration $iter ==="
+
+            python3 - > /tmp/aifix.md <<'PYEOF'
+          try:
+              with open('/tmp/build.log', 'rb') as f:
+                  log = f.read()[-12000:].decode('utf-8', errors='replace')
+          except Exception:
+              log = 'No build log available.'
+          print('# Task')
+          print()
+          print('The Rust build below failed. Read the source code, find the root cause, and fix it.')
+          print('Do not output JSON. Edit files directly using your tools.')
+          print()
+          print('# Workflow')
+          print()
+          print('1. Read the relevant source files. The build log points at the first error - trace it back to the offending code.')
+          print('2. Make the minimal fix.')
+          print('3. After editing, run `cargo build --release` to confirm the fix. If you changed behavior, run `cargo test` too.')
+          print('4. Do not commit. The workflow commits and pushes the diff after opencode returns.')
+          print()
+          print('# Rules')
+          print()
+          print('- Make the minimal change that fixes the build.')
+          print('- Do NOT edit `AGENTS.md`, `.forgejo/workflows/*`, or `Formula/*`.')
+          print('- Do NOT modify `Cargo.toml` version.')
+          print()
+          print('# Build log (last 12KB)')
+          print()
+          print('```')
+          print(log.rstrip())
+          print('```')
+          PYEOF
+
+            MODEL_ARG=""
+            if [ -n "$OPENCODE_MODEL" ]; then
+              MODEL_ARG="--model $OPENCODE_MODEL"
+            fi
+            opencode run "$(cat /tmp/aifix.md)" \
+              --format default \
+              --pure \
+              --dangerously-skip-permissions \
+              $MODEL_ARG || true
+
+            git config user.name  "$BOT_NAME"
+            git config user.email "$BOT_EMAIL"
+            git add -A
+            if ! git diff --staged --quiet; then
+              git commit -m "fix(ci): AI build-fix iteration $iter"
+              git push
+            else
+              echo "opencode produced no changes this iteration."
+            fi
+
+            set +e
+            case "${{ steps.detect.outputs.language }}" in
+              rust)   cargo build --release 2>&1 | tee /tmp/build.log ;;
+              go)     go build ./... 2>&1 | tee /tmp/build.log ;;
+              node)   npm run build 2>&1 | tee /tmp/build.log ;;
+              python) pip install -e . -q 2>&1 | tee /tmp/build.log ;;
+              *)      exit 1 ;;
+            esac
+            BUILD_RC=$?
+            set -e
+            if [ "$BUILD_RC" = "0" ]; then
+              echo "build OK after iteration $iter"
+              exit 0
+            fi
+          done
+          echo "AI-fix gave up after 3 iterations."
+          exit 1
+
+  create-pr:
+    needs: build-iterate
+    if: github.event_name == 'push' && needs.build-iterate.result == 'success'
+    runs-on: rust-ci
+    steps:
+      - name: Open PR issue-N -> devops
+        env:
+          FORGEJO_TOKEN: ${{ github.token }}
+          HEAD: ${{ github.ref_name }}
+          BASE: ${{ env.DEVOPS_BRANCH }}
+        run: |
+          set -euo pipefail
+          # github.ref_name = "issue-N" (strip refs/heads/)
+          # Fall back to ref parsing for older Forgejo versions.
+          if [ -z "$HEAD" ]; then
+            HEAD=$(echo "${{ github.ref }}" | sed 's|refs/heads/||')
+          fi
+          EXISTING=$(curl -s \
+            "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/pulls?state=open&head=$HEAD&base=$BASE" \
+            -H "Authorization: token $FORGEJO_TOKEN")
+          COUNT=$(echo "$EXISTING" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
+          if [ "$COUNT" -gt 0 ]; then
+            echo "PR already open for $HEAD -> $BASE - skipping."
+            exit 0
+          fi
+          python3 - > /tmp/pr_body.json << 'PYEOF'
+          import json, os
+          print(json.dumps({
+              'title': os.environ['HEAD'] + ' -> ' + os.environ['BASE'],
+              'head':  os.environ['HEAD'],
+              'base':  os.environ['BASE'],
+              'body':  'Automated PR from CI pipeline.',
+          }))
+          PYEOF
+          RESP=$(curl -s -X POST "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/pulls" \
+            -H "Authorization: token $FORGEJO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/pr_body.json)
+          if echo "$RESP" | grep -q '"id"'; then
+            echo "PR opened for $HEAD -> $BASE"
+          else
+            echo "::warning::PR creation failed: $RESP"
+            exit 1
+          fi"

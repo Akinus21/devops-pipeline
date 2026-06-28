@@ -1,0 +1,317 @@
+name: Level 2 — Devops
+
+on:
+  push:
+    branches: [devops]  # edit if your staging branch is named differently
+
+# See level1-main.yml for the full list of supported
+# vars.* keys. This workflow uses:
+#   DEVOPS_BRANCH  - source branch (default: devops)
+#   MAIN_BRANCH    - target branch for the PR (default: main)
+#   OPENCODE_MODEL - optional model override for `opencode run --model`
+#
+# The AI integration uses the local `opencode` CLI. opencode has full
+# file-tool access: it reads the codebase itself, decides what to
+# change, and edits files directly. The workflow then commits the
+# diff and pushes it.
+#
+env:
+  BOT_NAME:              ${{ vars.BOT_NAME || 'devops-bot' }}
+  BOT_EMAIL:             ${{ vars.BOT_EMAIL || 'devops-bot@akinus21.com' }}
+  DEVOPS_BRANCH:         ${{ vars.DEVOPS_BRANCH || 'devops' }}
+  MAIN_BRANCH:           ${{ vars.MAIN_BRANCH || 'main' }}
+  OPENCODE_MODEL:        ${{ vars.OPENCODE_MODEL || '' }}
+  GITHUB_SERVER_URL:     ${{ github.server_url }}
+  GITHUB_REPOSITORY:     ${{ github.repository }}
+
+concurrency:
+  group: level2-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-iterate:
+    runs-on: rust-ci
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Preflight opencode and github.token
+        run: |
+          set -euo pipefail
+          command -v opencode >/dev/null 2>&1 || {
+            echo "::error::opencode CLI not on PATH; install it on the runner and ensure the directory is on PATH."
+            exit 1
+          }
+          [ -n "${{ github.token }}" ] || { echo "::error::github.token is empty"; exit 1; }
+
+      - name: Setup Rust
+        if: hashFiles('Cargo.toml') != ''
+        uses: https://github.com/dtolnay/rust-toolchain@stable
+
+      - name: Setup Go
+        if: hashFiles('go.mod') != ''
+        uses: https://github.com/actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Setup Node
+        if: hashFiles('package.json') != ''
+        uses: https://github.com/actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python
+        if: hashFiles('pyproject.toml') != '' || hashFiles('setup.py') != ''
+        uses: https://github.com/actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Detect language
+        id: detect
+        run: |
+          if   [ -f Cargo.toml ];                         then echo "language=rust"   >> $GITHUB_OUTPUT
+          elif [ -f go.mod ];                             then echo "language=go"     >> $GITHUB_OUTPUT
+          elif [ -f package.json ];                       then echo "language=node"   >> $GITHUB_OUTPUT
+          elif [ -f pyproject.toml ] || [ -f setup.py ]; then echo "language=python" >> $GITHUB_OUTPUT
+          else                                                 echo "language=other"  >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build + Test (iteration 0)
+        id: build
+        run: |
+          set -o pipefail
+          case "${{ steps.detect.outputs.language }}" in
+            rust)
+              cargo build --release 2>&1 | tee /tmp/build.log
+              cargo test  --release 2>&1 | tee -a /tmp/build.log
+              ;;
+            go)
+              go build ./... 2>&1 | tee /tmp/build.log
+              go test  ./... 2>&1 | tee -a /tmp/build.log
+              ;;
+            node)
+              npm ci   2>&1 | tee /tmp/build.log
+              npm test 2>&1 | tee -a /tmp/build.log
+              ;;
+            python)
+              pip install -e . -q 2>&1 | tee /tmp/build.log
+              python -m pytest   2>&1 | tee -a /tmp/build.log
+              ;;
+            *)
+              echo "No build configured for language: ${{ steps.detect.outputs.language }}"
+              ;;
+          esac
+
+      - name: AI-fix loop (3 attempts)
+        if: failure()
+        run: |
+          set -uo pipefail
+          for iter in 1 2 3; do
+            echo "=== AI-fix iteration $iter ==="
+
+            python3 - > /tmp/aifix.md <<'PYEOF'
+          try:
+              with open('/tmp/build.log', 'rb') as f:
+                  log = f.read()[-12000:].decode('utf-8', errors='replace')
+          except Exception:
+              log = 'No build log available.'
+          print('# Task')
+          print()
+          print('The build below failed. Read the source code, find the root cause, and fix it.')
+          print('Do not output JSON. Edit files directly using your tools.')
+          print()
+          print('# Workflow')
+          print()
+          print('1. Read the relevant source files. The build log points at the first error - trace it back to the offending code.')
+          print('2. Make the minimal fix.')
+          print('3. After editing, run `cargo build --release` to confirm the fix. If you changed behavior, run `cargo test` too.')
+          print('4. Do not commit. The workflow commits and pushes the diff after opencode returns.')
+          print()
+          print('# Rules')
+          print()
+          print('- Make the minimal change that fixes the build.')
+          print('- Do NOT edit `AGENTS.md`, `.forgejo/workflows/*`, or `Formula/*`.')
+          print('- Do NOT modify `Cargo.toml` version.')
+          print()
+          print('# Build log (last 12KB)')
+          print()
+          print('```')
+          print(log.rstrip())
+          print('```')
+          PYEOF
+
+            MODEL_ARG=""
+            if [ -n "$OPENCODE_MODEL" ]; then
+              MODEL_ARG="--model $OPENCODE_MODEL"
+            fi
+            opencode run "$(cat /tmp/aifix.md)" \
+              --format default \
+              --pure \
+              --dangerously-skip-permissions \
+              $MODEL_ARG || true
+
+            git config user.name  "$BOT_NAME"
+            git config user.email "$BOT_EMAIL"
+            git add -A
+            if ! git diff --staged --quiet; then
+              git commit -m "fix(ci): AI build-fix iteration $iter"
+              git push
+            else
+              echo "opencode produced no changes this iteration."
+            fi
+
+            set +e
+            case "${{ steps.detect.outputs.language }}" in
+              rust)   cargo build --release 2>&1 | tee /tmp/build.log ;;
+              go)     go build ./... 2>&1 | tee /tmp/build.log ;;
+              node)   npm run build 2>&1 | tee /tmp/build.log ;;
+              python) pip install -e . -q 2>&1 | tee /tmp/build.log ;;
+              *)      exit 1 ;;
+            esac
+            BUILD_RC=$?
+            set -e
+            if [ "$BUILD_RC" = "0" ]; then
+              echo "build OK after iteration $iter"
+              exit 0
+            fi
+          done
+          echo "AI-fix gave up after 3 iterations."
+          exit 1
+
+  create-pr:
+    needs: build-iterate
+    if: needs.build-iterate.result == 'success'
+    runs-on: rust-ci
+    steps:
+      - name: Open PR devops -> main
+        env:
+          FORGEJO_TOKEN: ${{ github.token }}
+          HEAD: ${{ env.DEVOPS_BRANCH }}
+          BASE: ${{ env.MAIN_BRANCH }}
+        run: |
+          set -euo pipefail
+          EXISTING=$(curl -s \
+            "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/pulls?state=open&head=$HEAD&base=$BASE" \
+            -H "Authorization: token $FORGEJO_TOKEN")
+          COUNT=$(echo "$EXISTING" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
+          if [ "$COUNT" -gt 0 ]; then
+            echo "PR already open for $HEAD -> $BASE - skipping."
+            exit 0
+          fi
+          python3 - > /tmp/pr_body.json << 'PYEOF'
+          import json, os
+          print(json.dumps({
+              'title': os.environ['HEAD'] + ' -> ' + os.environ['BASE'],
+              'head':  os.environ['HEAD'],
+              'base':  os.environ['BASE'],
+              'body':  'Automated PR from CI pipeline.',
+          }))
+          PYEOF
+          cat /tmp/pr_body.json
+          RESP=$(curl -s -X POST "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/pulls" \
+            -H "Authorization: token $FORGEJO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/pr_body.json)
+          echo "$RESP"
+          if echo "$RESP" | grep -q '"id"'; then
+            echo "PR opened for $HEAD -> $BASE"
+          else
+            echo "::warning::PR creation failed: $RESP"
+            exit 1
+          fi
+
+  close-merged-issue:
+    needs: create-pr
+    if: needs.create-pr.result == 'success'
+    runs-on: rust-ci
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+          token: ${{ github.token }}
+
+      - name: Capture commit messages on this branch
+        id: scan
+        run: |
+          set -euo pipefail
+          git log "$MAIN_BRANCH..HEAD" --pretty=%B > /tmp/commits.txt || true
+          {
+            echo "commits<<EOF"
+            cat /tmp/commits.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "=== Captured commits ==="
+          cat /tmp/commits.txt
+
+      - name: Find Fixes/Closes markers and close referenced issues
+        env:
+          FORGEJO_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          COMMITS: ${{ steps.scan.outputs.commits }}
+          ISSUE_PREFIX: ${{ vars.ISSUE_BRANCH_PREFIX || 'issue-' }}
+          ISSUE_BRANCH_PREFIX: ${{ vars.ISSUE_BRANCH_PREFIX || 'issue-' }}
+          MAIN_BRANCH: ${{ vars.MAIN_BRANCH || 'main' }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GITHUB_SERVER_URL:-}" ]; then
+            echo "::error::GITHUB_SERVER_URL is empty; cannot close issues via API"
+            exit 1
+          fi
+          echo "=== Scanning commit messages for Fixes/Closes #N ==="
+          echo "$COMMITS"
+
+          COMMITS="$COMMITS" \
+          FORGEJO_TOKEN="$FORGEJO_TOKEN" \
+          REPO="$REPO" \
+          ISSUE_PREFIX="$ISSUE_PREFIX" \
+          GITHUB_SERVER_URL="$GITHUB_SERVER_URL" \
+          python3 - << 'PYEOF'
+          import os, re, sys, json, urllib.request, urllib.error
+
+          TOKEN  = os.environ['FORGEJO_TOKEN']
+          REPO   = os.environ['REPO']
+          SERVER = os.environ['GITHUB_SERVER_URL']
+          commits = os.environ.get('COMMITS', '')
+
+          issue_nums = sorted(set(int(m.group(1)) for m in re.finditer(
+              r'(?i)\b(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?)\s+#(\d+)', commits
+          )))
+
+          if not issue_nums:
+              print("no Fixes/Closes #N markers found")
+              sys.exit(0)
+
+          def api(method, path, body=None):
+              data = json.dumps(body).encode() if body else None
+              req = urllib.request.Request(
+                  f"{SERVER}/api/v1/{path}", data=data, method=method,
+                  headers={"Authorization": f"token {TOKEN}",
+                           "Content-Type": "application/json"})
+              try:
+                  with urllib.request.urlopen(req) as r:
+                      return json.loads(r.read() or b'{}')
+              except urllib.error.HTTPError as e:
+                  print(f"HTTP {e.code}: {method} {path}", file=__import__('sys').stderr)
+                  return None
+
+          for n in issue_nums:
+              issue = api("GET", f"repos/{REPO}/issues/{n}")
+              if not issue:
+                  print(f"issue #{n} not found")
+                  continue
+              if issue.get('state') == 'closed':
+                  print(f"issue #{n} already closed")
+                  continue
+              if 'pull_request' in issue:
+                  print(f"#{n} is a PR, skipping")
+                  continue
+
+              body = (f"Closed automatically: merged into $MAIN_BRANCH via this PR. "
+                      f"See commit history for details.")
+              api("POST", f"repos/{REPO}/issues/{n}/comments", {"body": body})
+              ok = api("PATCH", f"repos/{REPO}/issues/{n}", {"state": "closed"})
+              print(f"closed issue #{n}: {'ok' if ok else 'failed'}")
+          PYEOF
