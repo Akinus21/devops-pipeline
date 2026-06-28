@@ -1,0 +1,104 @@
+name: Level 0 — Sync from Template
+
+on:
+  push:
+    branches: ['{{ MAIN_BRANCH }}']
+  workflow_dispatch:
+
+jobs:
+  sync-workflows:
+    runs-on: rust-ci
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Fetch template workflows
+        run: |
+          set -euo pipefail
+          # Derive the template repo URL from the current server URL.
+          # e.g. https://forge.akinus21.com/akinus/devops-pipeline
+          SERVER="${{ github.server_url }}"
+          OWNER="${{ github.repository_owner }}"
+          TEMPLATE_URL="${SERVER}/${OWNER}/devops-pipeline.git"
+          echo "Fetching template from: $TEMPLATE_URL"
+          git clone --depth=1 "$TEMPLATE_URL" /tmp/template
+
+      - name: Detect per-repo branch names
+        id: detect
+        run: |
+          set -euo pipefail
+          # install.sh rewrites these literals in the workflow files.
+          # We need the same values to apply the same rewrite before comparing.
+          MAIN_BRANCH=$(grep -m1 'MAIN_BRANCH' .forgejo/workflows/level1-main.yml | awk -F"'" '{print $2}')
+          DEV_BRANCH=$(grep -m1 'DEV_BRANCH\|DEVOPS_BRANCH' .forgejo/workflows/level1-main.yml | awk -F"'" '{print $2}')
+          ISSUE_PREFIX=$(grep -m1 'ISSUE_BRANCH_PREFIX' .forgejo/workflows/level1-main.yml | awk -F"'" '{print $2}')
+          ISSUE_PREFIX_RE=$(printf '%s' "$ISSUE_PREFIX" | sed 's/[][\\.^$*]/\\&/g')
+          echo "Detected: main=$MAIN_BRANCH devops=$DEV_BRANCH issue_prefix=$ISSUE_PREFIX"
+          echo "MAIN_BRANCH=$MAIN_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "DEV_BRANCH=$DEV_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "ISSUE_PREFIX=$ISSUE_PREFIX" >> "$GITHUB_OUTPUT"
+          echo "ISSUE_PREFIX_RE=$ISSUE_PREFIX_RE" >> "$GITHUB_OUTPUT"
+
+      - name: Compare and update workflows
+        id: update
+        run: |
+          set -euo pipefail
+          MAIN_BRANCH="${{ steps.detect.outputs.MAIN_BRANCH }}"
+          DEV_BRANCH="${{ steps.detect.outputs.DEV_BRANCH }}"
+          ISSUE_PREFIX="${{ steps.detect.outputs.ISSUE_PREFIX }}"
+          ISSUE_PREFIX_RE="${{ steps.detect.outputs.ISSUE_PREFIX_RE }}"
+
+          TEMPLATE_DIR="/tmp/template/.forgejo/workflows"
+          LOCAL_DIR=".forgejo/workflows"
+
+          # The install.sh sed transformations (applied to template before compare)
+          apply_install_rewrite() {
+            localwf="$1"
+            sed -e "s|branches: \\[main\\] *#.*|branches: [$MAIN_BRANCH]|" \
+                -e "s|branches: \\[devops\\] *#.*|branches: [$DEV_BRANCH]|" \
+                -e "s|branches: \\[issue-\\*\\] *#.*|branches: [${ISSUE_PREFIX_RE}*]|" \
+                "$localwf"
+          }
+
+          CHANGED=0
+          for wf in level1-main level2-devops level3-issues; do
+            TEMPLATE_FILE="$TEMPLATE_DIR/${wf}.yml"
+            LOCAL_FILE="$LOCAL_DIR/${wf}.yml"
+
+            if [ ! -f "$TEMPLATE_FILE" ]; then
+              echo "Template file missing: ${wf}.yml — skipping"
+              continue
+            fi
+
+            # Rewrite the template copy with this repo's branch names
+            apply_install_rewrite "$TEMPLATE_FILE" > /tmp/${wf}-rewritten.yml
+
+            if ! diff -q "$LOCAL_FILE" "/tmp/${wf}-rewritten.yml" > /dev/null 2>&1; then
+              echo "=== ${wf}.yml differs from template — updating ==="
+              cp "/tmp/${wf}-rewritten.yml" "$LOCAL_FILE"
+              CHANGED=1
+            else
+              echo "${wf}.yml: up to date"
+            fi
+          done
+
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push
+        if: steps.update.outputs.changed == '1'
+        env:
+          BOT_NAME: ${{ vars.BOT_NAME || 'devops-bot' }}
+          BOT_EMAIL: ${{ vars.BOT_EMAIL || 'devops-bot@akinus21.com' }}
+        run: |
+          set -euo pipefail
+          git config user.name  "$BOT_NAME"
+          git config user.email "$BOT_EMAIL"
+          git add -A
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: sync workflows from devops-pipeline template [release-bot-skip]"
+            GIT_SSH_COMMAND="ssh -i /home/akinus/.ssh/github -o StrictHostKeyChecking=no" \
+              git push origin "${{ github.ref_name }}"
+          fi

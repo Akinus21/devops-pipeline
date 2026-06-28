@@ -109,7 +109,7 @@ git checkout "$DEV_BRANCH" 2>/dev/null || git checkout -b "$DEV_BRANCH"
 
 # ---------- copy workflow files ----------
 mkdir -p .forgejo/workflows
-for f in level1-main.yml level2-devops.yml level3-issues.yml; do
+for f in level0-sync.yml level1-main.yml level2-devops.yml level3-issues.yml; do
   cp "$WORKFLOW_SRC/$f" ".forgejo/workflows/$f"
   echo "Copied .forgejo/workflows/$f"
 done
@@ -119,6 +119,7 @@ done
 # YAML parser doesn't accept template expressions in on.push.branches).
 # Replace them here so the install honours env overrides.
 ISSUE_PREFIX_RE=$(printf '%s' "$ISSUE_BRANCH_PREFIX" | sed 's/[][\\.^$*]/\\&/g')
+sed -i "s|branches: \\['{{ MAIN_BRANCH }}'\\]|branches: [$MAIN_BRANCH]|" .forgejo/workflows/level0-sync.yml
 sed -i "s|branches: \\[main\\] *#.*|branches: [$MAIN_BRANCH]|" .forgejo/workflows/level1-main.yml
 sed -i "s|branches: \\[devops\\] *#.*|branches: [$DEV_BRANCH]|" .forgejo/workflows/level2-devops.yml
 sed -i "s|branches: \\[issue-\\*\\] *#.*|branches: [${ISSUE_PREFIX_RE}*]|" .forgejo/workflows/level3-issues.yml
