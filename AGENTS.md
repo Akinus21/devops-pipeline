@@ -63,6 +63,9 @@ The `[release-bot-skip]` marker on commit messages causes:
 
 So when level 1's release job pushes the bump commit, the resulting CI run is a no-op for that workflow.
 
+### Level 0 — Template sync
+Every repo (including devops-pipeline itself) runs `level0-sync.yml` on every push to `main`. It clones `devops-pipeline`, rewrites the template workflows with per-repo branch names (matching `install.sh`'s sed rules), diffs against the local workflows, and commits + pushes any updates. This makes `devops-pipeline` the single source of truth for all three workflow files — bug fixes, new features, and variable changes flow from the template to each repo automatically. When run against devops-pipeline itself, the clone is a no-op since template equals local.
+
 ## Configuration via repo variables
 
 All knobs are Forgejo repo variables (Settings → Actions → Variables). Every variable has a sensible default baked into the workflow, so the pipeline runs out-of-the-box with zero configuration.
@@ -102,7 +105,7 @@ DEV_BRANCH=staging MAIN_BRANCH=production ./install.sh /path/to/another-project
 The installer:
 1. Clones (or uses existing) the target repo.
 2. Creates `<DEVOPS_BRANCH>` if missing.
-3. Copies `.forgejo/workflows/{level1-main,level2-devops,level3-issues}.yml`.
+3. Copies `.forgejo/workflows/{level0-sync,level1-main,level2-devops,level3-issues}.yml` and rewrites branch-name literals.
 4. Optionally writes a `Formula/<name>.rb` stub (with `WITH_FORMULA=1`).
 5. Commits and pushes to `<DEVOPS_BRANCH>`.
 
@@ -134,6 +137,7 @@ akclip/
 ├── .gitignore                # Excludes /target, *.log, scratch files
 ├── .forgejo/                 # CI/CD workflows (3-level architecture)
 │   └── workflows/
+│       ├── level0-sync.yml      # Level 0: sync workflow files from devops-pipeline template
 │       ├── level1-main.yml       # Level 1: build, release (bump+cut), bottles, formula, tidy
 │       ├── level2-devops.yml     # Level 2: build, PR to main, close-merged-issue
 │       └── level3-issues.yml     # Level 3: triage, auto-fix, build, PR to devops
@@ -156,7 +160,7 @@ akclip/
 
 ### Local Build (for debugging)
 ```bash
-cd /home/akinus/dockge-stacks/dev-stack/projects/akclip
+cd /var/home/gabriel/Projects/akclip
 cargo build --release
 ./target/release/akclip --help
 ```
@@ -182,7 +186,7 @@ cargo build --release
 The `gh` CLI is not authenticated in the CI environment, so use SSH directly with the provided key.
 
 ```bash
-cd /home/akinus/dockge-stacks/dev-stack/projects/akclip
+cd /var/home/gabriel/Projects/akclip
 git add -A
 git commit -m "<description>"
 GIT_SSH_COMMAND="ssh -i /home/akinus/.ssh/github -o StrictHostKeyChecking=no" \
@@ -193,11 +197,7 @@ git push origin main
 
 ## Secrets & Configuration Management
 - **SSH key** for Git operations: `/home/akinus/.ssh/github`
-- **Project‑specific secrets** (e.g., API tokens for the webhook) are stored in:
-  ```
-  /home/akinus/dockge-stacks/dev-stack/.secrets
-  ```
-  The repository contains a symlink `.secrets` pointing to that location. Do **not** commit real secrets; rely on the symlink.
+- **Project‑specific secrets** (e.g., API tokens for the webhook) are stored on the runner host at `/home/akinus/docker/devops-stack/.secrets`. The repository contains a symlink `.secrets` pointing to that location. Do **not** commit real secrets; rely on the symlink.
 
 ## Documentation Updates
 Whenever you add features, change CLI flags, or modify platform behavior:
